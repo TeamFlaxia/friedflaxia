@@ -1,5 +1,6 @@
 //! Model forward passes built on GGUF tensors.
 
+pub mod d1_vision;
 pub mod d1omni;
 pub mod embeddinggemma;
 pub mod gemma_audio;
