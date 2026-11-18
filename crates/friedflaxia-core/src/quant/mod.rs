@@ -5,6 +5,7 @@
 
 mod bf16;
 mod f16;
+mod matvec;
 mod q4_0;
 mod q4_1;
 mod q6_k;
@@ -12,6 +13,9 @@ mod q8_0;
 
 pub use bf16::dequantize_bf16;
 pub use f16::f16_to_f32;
+pub use matvec::{
+    MatvecError, matvec_bf16, matvec_f32, matvec_q4_0, matvec_q4_1, matvec_q6_k, matvec_q8_0,
+};
 pub use q4_0::dequantize_q4_0;
 pub use q4_1::dequantize_q4_1;
 pub use q6_k::dequantize_q6_k;
