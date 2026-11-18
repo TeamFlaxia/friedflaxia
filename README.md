@@ -35,19 +35,20 @@ Everything else in `ai-inference` is out of scope.
 The first slice is complete:
 
 - GGUF v2/v3 metadata and tensor-index parser
-- Q4_0, Q8_0 and BF16 dequantization
-- F16 scale decoding
-- Real-header verification against PLaMo, d1-omni and EmbeddingGemma GGUF files
+- Q4_0, Q4_1, Q6_K, Q8_0 and BF16 dequantization, plus F16 scale decoding
+- Quantized matrix-vector kernels for Q4_0/Q4_1/Q6_K/Q8_0/F32/BF16
+- GGUF tokenizer metadata (vocab, scores, token types, merges, special tokens)
+- Architecture-scoped configuration reader
+- Real-header verification against PLaMO, d1-omni and EmbeddingGemma GGUF files
 
 Next slices:
 
-1. Q4_1 and Q6_K (PLaMo's output tensor is Q6_K)
-2. GGUF tokenizer metadata reader (BPE and Unigram)
-3. Quantized matrix-vector kernels
-4. EmbeddingGemma text embedder
-5. d1-omni decision forward
-6. PLaMo generation
-7. NudeNet YOLOv8 + NMS
+1. Tokenizer encode/decode (BPE for d1/EmbeddingGemma, Unigram for PLaMO)
+2. Tensor range loader for streaming GGUF payloads
+3. EmbeddingGemma text embedder
+4. d1-omni decision forward
+5. PLaMO generation
+6. NudeNet YOLOv8 + NMS
 
 ## Development
 

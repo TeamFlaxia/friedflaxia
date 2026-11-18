@@ -116,6 +116,17 @@ fn parses_metadata_and_one_tensor() {
 }
 
 #[test]
+fn iterates_metadata_entries() {
+    let bytes = build_fixture();
+    let gguf = Gguf::parse(&bytes).expect("valid GGUF");
+    let keys: Vec<&str> = gguf.metadata_entries().map(|(key, _)| key).collect();
+    assert_eq!(keys.len(), 4);
+    assert!(keys.contains(&"general.architecture"));
+    assert!(keys.contains(&"tokenizer.ggml.tokens"));
+    assert!(keys.contains(&"test.value"));
+}
+
+#[test]
 fn alignment_pads_the_data_section() {
     let bytes = build_fixture();
     let gguf = Gguf::parse(&bytes).expect("valid GGUF");

@@ -56,6 +56,14 @@ fn main() {
         println!("tokenizer metadata present but not readable");
     }
 
+    let mut entries: Vec<(&str, &Value)> = gguf.metadata_entries().collect();
+    entries.sort_by_key(|(key, _)| *key);
+    for (key, value) in entries {
+        if !matches!(value, Value::Array(_)) {
+            println!("kv {key} = {}", summarize(value));
+        }
+    }
+
     for tensor in gguf.tensors() {
         println!(
             "tensor {} type={:?} dims={:?} elements={} bytes={:?} offset={}",

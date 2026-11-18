@@ -10,7 +10,9 @@ use std::fmt;
 mod reader;
 mod value;
 
+pub mod config;
 pub mod tokenizer;
+pub use config::{ConfigError, ModelConfig};
 pub use value::{TensorType, Value};
 
 use reader::Reader;
@@ -139,6 +141,13 @@ impl Gguf {
 
     pub fn metadata(&self, key: &str) -> Option<&Value> {
         self.metadata.get(key)
+    }
+
+    /// Iterate over every metadata key/value pair.
+    pub fn metadata_entries(&self) -> impl Iterator<Item = (&str, &Value)> {
+        self.metadata
+            .iter()
+            .map(|(key, value)| (key.as_str(), value))
     }
 
     pub fn tensor_count(&self) -> usize {
