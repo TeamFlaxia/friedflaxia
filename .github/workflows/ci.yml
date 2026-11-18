@@ -116,3 +116,5 @@ jobs:
             cargo test --release --test unigram_real -- --ignored --nocapture
           FRIEDFLAXIA_PLAMO_GGUF="$MODEL_PATH" \
             cargo test --release --test plamo3 -- --ignored --nocapture
+          FRIEDFLAXIA_PLAMO_GGUF="$MODEL_PATH" \
+            cargo test --release -p friedflaxia-wasm --test plamo_generate -- --ignored --nocapture

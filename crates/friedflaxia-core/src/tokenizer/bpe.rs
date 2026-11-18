@@ -186,6 +186,24 @@ impl BpeTokenizer {
                 .is_some_and(|token_type| *token_type == TokenType::Control)
     }
 
+    pub fn token_id(&self, token: &str) -> Option<u32> {
+        self.vocab.get(token).copied()
+    }
+
+    pub fn is_control(&self, id: u32) -> bool {
+        self.token_types
+            .get(id as usize)
+            .is_some_and(|token_type| *token_type == TokenType::Control)
+    }
+
+    pub fn bos_token_id(&self) -> u32 {
+        self.bos_token_id
+    }
+
+    pub fn eos_token_id(&self) -> u32 {
+        self.eos_token_id
+    }
+
     fn token(&self, id: u32) -> Result<&str> {
         self.tokens
             .get(id as usize)

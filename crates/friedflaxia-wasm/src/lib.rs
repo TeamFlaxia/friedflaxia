@@ -7,7 +7,7 @@ use friedflaxia_core::gguf::tokenizer::{TokenizerError, TokenizerSpec};
 use friedflaxia_core::gguf::{Gguf, ParseOptions};
 use friedflaxia_core::models::d1omni::decision_logits;
 use friedflaxia_core::models::embeddinggemma::embed_text;
-use friedflaxia_core::models::plamo3::next_token;
+use friedflaxia_core::models::plamo3::{PlamoSession, next_token};
 use friedflaxia_core::tokenizer::{BpeTokenizer, UnigramTokenizer};
 use std::fmt;
 use wasm_bindgen::prelude::*;
@@ -56,6 +56,34 @@ impl Tokenizer {
         match self {
             Self::Bpe(tokenizer) => tokenizer.decode(ids),
             Self::Unigram(tokenizer) => tokenizer.decode(ids),
+        }
+    }
+
+    fn token_id(&self, token: &str) -> Option<u32> {
+        match self {
+            Self::Bpe(tokenizer) => tokenizer.token_id(token),
+            Self::Unigram(tokenizer) => tokenizer.token_id(token),
+        }
+    }
+
+    fn is_control(&self, id: u32) -> bool {
+        match self {
+            Self::Bpe(tokenizer) => tokenizer.is_control(id),
+            Self::Unigram(tokenizer) => tokenizer.is_control(id),
+        }
+    }
+
+    fn bos_token_id(&self) -> u32 {
+        match self {
+            Self::Bpe(tokenizer) => tokenizer.bos_token_id(),
+            Self::Unigram(tokenizer) => tokenizer.bos_token_id(),
+        }
+    }
+
+    fn eos_token_id(&self) -> u32 {
+        match self {
+            Self::Bpe(tokenizer) => tokenizer.eos_token_id(),
+            Self::Unigram(tokenizer) => tokenizer.eos_token_id(),
         }
     }
 }
@@ -143,6 +171,18 @@ impl Engine {
         Ok(tokenizer.decode(ids)?)
     }
 
+    pub fn token_id(&self, token: &str) -> Option<u32> {
+        self.tokenizer.as_ref()?.token_id(token)
+    }
+
+    pub fn bos_token_id(&self) -> Option<u32> {
+        self.tokenizer.as_ref().map(Tokenizer::bos_token_id)
+    }
+
+    pub fn eos_token_id(&self) -> Option<u32> {
+        self.tokenizer.as_ref().map(Tokenizer::eos_token_id)
+    }
+
     pub fn embed(&self, token_ids: &[u32]) -> Result<Vec<f32>, EngineError> {
         if self.kind != ModelKind::EmbeddingGemma {
             return Err(EngineError::new("model is not gemma-embedding2"));
@@ -180,6 +220,48 @@ impl Engine {
         next_token(&self.gguf, &self.bytes, token_ids)
             .map_err(|error| EngineError::new(error.to_string()))
     }
+
+    /// Generate up to `max_tokens` greedy tokens with the PLaMO KV cache.
+    /// Returns only newly generated ids (the prompt is not included).
+    pub fn generate(&self, prompt_ids: &[u32], max_tokens: u32) -> Result<Vec<u32>, EngineError> {
+        if self.kind != ModelKind::Plamo3 {
+            return Err(EngineError::new("model is not plamo3"));
+        }
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| EngineError::new("GGUF has no supported tokenizer"))?;
+        let limit = max_tokens.min(4096);
+        let mut session = PlamoSession::new(&self.gguf, &self.bytes)
+            .map_err(|error| EngineError::new(error.to_string()))?;
+        let mut logits = session
+            .prefill(prompt_ids)
+            .map_err(|error| EngineError::new(error.to_string()))?;
+        let eos = tokenizer.eos_token_id();
+        let mut generated = Vec::new();
+        for _ in 0..limit {
+            let next = argmax(&logits)?;
+            if next == eos || tokenizer.is_control(next) {
+                break;
+            }
+            generated.push(next);
+            logits = session
+                .decode(next)
+                .map_err(|error| EngineError::new(error.to_string()))?;
+        }
+        Ok(generated)
+    }
+}
+
+fn argmax(values: &[f32]) -> Result<u32, EngineError> {
+    let (index, _) = values
+        .iter()
+        .enumerate()
+        .max_by(|(_, left), (_, right)| {
+            left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .ok_or_else(|| EngineError::new("model returned empty logits"))?;
+    Ok(index as u32)
 }
 
 #[wasm_bindgen]
@@ -235,6 +317,24 @@ impl Model {
 
     pub fn next_token(&self, token_ids: &[u32]) -> Result<u32, JsValue> {
         self.engine.next_token(token_ids).map_err(js_error)
+    }
+
+    pub fn token_id(&self, token: &str) -> Option<u32> {
+        self.engine.token_id(token)
+    }
+
+    pub fn bos_token_id(&self) -> Option<u32> {
+        self.engine.bos_token_id()
+    }
+
+    pub fn eos_token_id(&self) -> Option<u32> {
+        self.engine.eos_token_id()
+    }
+
+    pub fn generate(&self, prompt_ids: &[u32], max_tokens: u32) -> Result<Vec<u32>, JsValue> {
+        self.engine
+            .generate(prompt_ids, max_tokens)
+            .map_err(js_error)
     }
 }
 
