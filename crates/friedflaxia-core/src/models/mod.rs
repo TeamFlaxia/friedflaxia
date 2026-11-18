@@ -2,6 +2,7 @@
 
 pub mod d1omni;
 pub mod embeddinggemma;
+pub mod nudenet;
 pub mod plamo3;
 
 use crate::gguf::ConfigError;

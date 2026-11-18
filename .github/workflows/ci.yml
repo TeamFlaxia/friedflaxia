@@ -88,6 +88,28 @@ jobs:
           FRIEDFLAXIA_D1_GGUF="$MODEL_PATH" \
             cargo test --release --test d1omni -- --ignored --nocapture
 
+  nudenet-parity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install converter dependencies
+        run: pip install --quiet numpy onnx gguf
+      - name: Download pinned NudeNet ONNX weights
+        run: |
+          curl -fL --retry 3 -o /tmp/320n.onnx \
+            https://huggingface.co/deepghs/nudenet_onnx/resolve/44956a0587943016350c7815f9e0dec089d45cae/320n.onnx
+      - name: Convert to GGUF and run parity
+        run: |
+          python3 tools/convert_nudenet.py /tmp/320n.onnx /tmp/nudenet-320n-f32.gguf
+          FRIEDFLAXIA_NUDENET_GGUF=/tmp/nudenet-320n-f32.gguf \
+            cargo test --release --test nudenet -- --ignored --nocapture
+          cargo test --release --test nudenet -- --nocapture
+
   plamo-parity:
     runs-on: ubuntu-latest
     timeout-minutes: 25
