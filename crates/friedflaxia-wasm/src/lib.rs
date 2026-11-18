@@ -155,6 +155,18 @@ impl Engine {
         self.gguf.tensor_count()
     }
 
+    pub fn metadata_f32(&self, key: &str) -> Option<f32> {
+        self.gguf
+            .metadata(key)
+            .and_then(friedflaxia_core::gguf::Value::as_f32)
+    }
+
+    pub fn metadata_u32(&self, key: &str) -> Option<u32> {
+        self.gguf
+            .metadata(key)
+            .and_then(friedflaxia_core::gguf::Value::as_u32)
+    }
+
     pub fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>, EngineError> {
         let tokenizer = self
             .tokenizer
@@ -284,6 +296,14 @@ impl Model {
 
     pub fn tensor_count(&self) -> usize {
         self.engine.tensor_count()
+    }
+
+    pub fn metadata_f32(&self, key: &str) -> Option<f32> {
+        self.engine.metadata_f32(key)
+    }
+
+    pub fn metadata_u32(&self, key: &str) -> Option<u32> {
+        self.engine.metadata_u32(key)
     }
 
     pub fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>, JsValue> {
