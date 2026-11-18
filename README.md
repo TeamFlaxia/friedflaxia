@@ -32,23 +32,38 @@ Everything else in `ai-inference` is out of scope.
 
 ## Status
 
-The first slice is complete:
+Implemented and tested:
 
-- GGUF v2/v3 metadata and tensor-index parser
+- GGUF v2/v3 metadata and tensor-index parser, with tokenizer metadata skipping
 - Q4_0, Q4_1, Q6_K, Q8_0 and BF16 dequantization, plus F16 scale decoding
 - Quantized matrix-vector kernels for Q4_0/Q4_1/Q6_K/Q8_0/F32/BF16
 - GGUF tokenizer metadata (vocab, scores, token types, merges, special tokens)
 - Architecture-scoped configuration reader
-- Real-header verification against PLaMO, d1-omni and EmbeddingGemma GGUF files
+- Tensor views with row access for quantized token embeddings
+- RMSNorm, tanh-GELU, softmax, NeoX RoPE and pooling primitives
+- **EmbeddingGemma 2 text forward pass** (non-causal attention, sliding-window
+  layers, per-layer projection tower, mean pooling and L2 normalization)
+
+The EmbeddingGemma forward is verified against the ONNX `sentence_embedding`
+output for a pinned token sequence:
+
+```sh
+FRIEDFLAXIA_EMBED_GEMMA_GGUF=/path/embeddinggemma-2-Q8_0.gguf \
+  cargo test --release --test embeddinggemma -- --ignored --nocapture
+```
+
+Current parity: cosine `0.99994`, max absolute difference `0.00136` (Q8_0 GGUF
+vs ONNX quantized, same 9-token input). The CI workflow downloads the pinned
+Q8_0 GGUF and checks its SHA-256 before running this test.
 
 Next slices:
 
 1. Tokenizer encode/decode (BPE for d1/EmbeddingGemma, Unigram for PLaMO)
 2. Tensor range loader for streaming GGUF payloads
-3. EmbeddingGemma text embedder
-4. d1-omni decision forward
-5. PLaMO generation
-6. NudeNet YOLOv8 + NMS
+3. d1-omni decision forward
+4. PLaMO generation
+5. NudeNet YOLOv8 + NMS
+6. wasm-bindgen package for the browser node
 
 ## Development
 

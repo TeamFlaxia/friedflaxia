@@ -1,4 +1,4 @@
-use friedflaxia_core::gguf::{Gguf, GgufError, TensorType, Value};
+use friedflaxia_core::gguf::{Gguf, GgufError, ParseOptions, TensorType, Value};
 
 const GGUF_MAGIC: &[u8; 4] = b"GGUF";
 const GGUF_VERSION: u32 = 3;
@@ -113,6 +113,27 @@ fn parses_metadata_and_one_tensor() {
         .expect("tensor bytes");
     assert_eq!(data.len(), 68);
     assert_eq!(&data[..2], &0x3c00u16.to_le_bytes());
+}
+
+#[test]
+fn can_skip_tokenizer_metadata() {
+    let bytes = build_fixture();
+    let gguf = Gguf::parse_with_options(
+        &bytes,
+        ParseOptions {
+            skip_tokenizer: true,
+        },
+    )
+    .expect("valid GGUF");
+
+    assert!(gguf.metadata("tokenizer.ggml.tokens").is_none());
+    assert_eq!(
+        gguf.metadata("general.architecture")
+            .and_then(Value::as_str),
+        Some("test-arch")
+    );
+    assert_eq!(gguf.tensor_count(), 1);
+    assert!(gguf.tensor_data(&bytes, "token_embd.weight").is_ok());
 }
 
 #[test]

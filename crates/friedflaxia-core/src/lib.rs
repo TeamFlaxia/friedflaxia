@@ -5,4 +5,7 @@
 //! models. Model forward passes are built on top of this crate.
 
 pub mod gguf;
+pub mod models;
+pub mod ops;
 pub mod quant;
+pub mod tensor;

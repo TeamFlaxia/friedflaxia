@@ -52,6 +52,15 @@ impl TensorInfo {
     }
 }
 
+/// Options for header parsing.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ParseOptions {
+    /// Skip every `tokenizer.*` metadata value. Forward passes only need the
+    /// tensor index and model configuration, and tokenizer vocabularies can be
+    /// tens of megabytes.
+    pub skip_tokenizer: bool,
+}
+
 /// Parsed GGUF header plus tensor metadata.
 #[derive(Debug)]
 pub struct Gguf {
@@ -68,6 +77,11 @@ impl Gguf {
     /// Tensor payload bytes are not required for this call; they are validated
     /// lazily by [`Gguf::tensor_data`].
     pub fn parse(bytes: &[u8]) -> Result<Self, GgufError> {
+        Self::parse_with_options(bytes, ParseOptions::default())
+    }
+
+    /// Parse a header, optionally skipping large tokenizer metadata.
+    pub fn parse_with_options(bytes: &[u8], options: ParseOptions) -> Result<Self, GgufError> {
         let mut reader = Reader::new(bytes);
 
         if reader.take(4)? != GGUF_MAGIC {
@@ -90,6 +104,10 @@ impl Gguf {
         let mut metadata = HashMap::with_capacity(metadata_count as usize);
         for _ in 0..metadata_count {
             let key = reader.string(MAX_STRING_BYTES)?;
+            if options.skip_tokenizer && key.starts_with("tokenizer.") {
+                skip_value(&mut reader, 0)?;
+                continue;
+            }
             let value = read_value(&mut reader, 0)?;
             metadata.insert(key, value);
         }
@@ -249,6 +267,60 @@ fn read_value_of_type(
         other => return Err(GgufError::UnknownMetadataType(other)),
     };
     Ok(value)
+}
+
+/// Advance past one metadata value without allocating its contents.
+fn skip_value(reader: &mut Reader<'_>, depth: u32) -> Result<(), GgufError> {
+    let value_type = reader.u32()?;
+    skip_value_of_type(reader, value_type, depth)
+}
+
+fn skip_value_of_type(
+    reader: &mut Reader<'_>,
+    value_type: u32,
+    depth: u32,
+) -> Result<(), GgufError> {
+    match value_type {
+        0 | 1 | 7 => {
+            reader.take(1)?;
+        }
+        2 | 3 => {
+            reader.take(2)?;
+        }
+        4..=6 => {
+            reader.take(4)?;
+        }
+        10..=12 => {
+            reader.take(8)?;
+        }
+        8 => {
+            let len = reader.u64()?;
+            if len > MAX_STRING_BYTES {
+                return Err(GgufError::LimitExceeded("string length"));
+            }
+            reader.take(usize::try_from(len).map_err(|_| GgufError::IntegerOverflow)?)?;
+        }
+        9 => {
+            if depth >= MAX_ARRAY_DEPTH {
+                return Err(GgufError::LimitExceeded("array nesting"));
+            }
+            let element_type = reader.u32()?;
+            if element_type == 9 {
+                return Err(GgufError::InvalidMetadata(
+                    "nested arrays are not supported",
+                ));
+            }
+            let count = reader.u64()?;
+            if count > MAX_ARRAY_ELEMENTS {
+                return Err(GgufError::LimitExceeded("array length"));
+            }
+            for _ in 0..count {
+                skip_value_of_type(reader, element_type, depth + 1)?;
+            }
+        }
+        other => return Err(GgufError::UnknownMetadataType(other)),
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

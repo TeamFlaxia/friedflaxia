@@ -44,6 +44,41 @@ impl<'a> ModelConfig<'a> {
         })
     }
 
+    pub fn i32_array(&self, suffix: &str) -> Result<Option<Vec<i32>>, ConfigError> {
+        let Some(value) = self.raw(suffix) else {
+            return Ok(None);
+        };
+        let Value::Array(values) = value else {
+            return Err(ConfigError::WrongType(self.key(suffix), "array"));
+        };
+        values
+            .iter()
+            .map(|value| {
+                value
+                    .as_i32()
+                    .ok_or_else(|| ConfigError::WrongType(self.key(suffix), "i32 array"))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some)
+    }
+
+    pub fn bool_array(&self, suffix: &str) -> Result<Option<Vec<bool>>, ConfigError> {
+        let Some(value) = self.raw(suffix) else {
+            return Ok(None);
+        };
+        let Value::Array(values) = value else {
+            return Err(ConfigError::WrongType(self.key(suffix), "array"));
+        };
+        values
+            .iter()
+            .map(|value| match value {
+                Value::Bool(value) => Ok(*value),
+                _ => Err(ConfigError::WrongType(self.key(suffix), "bool array")),
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some)
+    }
+
     pub fn string(&self, suffix: &str) -> Result<Option<&'a str>, ConfigError> {
         let Some(value) = self.raw(suffix) else {
             return Ok(None);

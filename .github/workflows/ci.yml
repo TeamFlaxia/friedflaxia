@@ -29,3 +29,30 @@ jobs:
           targets: wasm32-unknown-unknown
       - name: Build for wasm32
         run: cargo build --target wasm32-unknown-unknown
+
+  embeddinggemma-parity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      MODEL_URL: https://huggingface.co/unsloth/embeddinggemma-2-GGUF/resolve/main/embeddinggemma-2-Q8_0.gguf
+      MODEL_SHA256: 6f1bd4ac6c5df7444f9cca7ca36cafe6cfa34cd6f49fefb1e0b4be8143aed8bc
+      MODEL_PATH: ${{ github.workspace }}/.cache/embeddinggemma-2-Q8_0.gguf
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache the pinned EmbeddingGemma GGUF
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.cache/embeddinggemma-2-Q8_0.gguf
+          key: embedgemma-q8-${{ env.MODEL_SHA256 }}
+      - name: Download and verify the GGUF
+        run: |
+          mkdir -p "$(dirname "$MODEL_PATH")"
+          if [ ! -f "$MODEL_PATH" ]; then
+            curl -fL --retry 3 --retry-delay 2 -o "$MODEL_PATH" "$MODEL_URL"
+          fi
+          echo "$MODEL_SHA256  $MODEL_PATH" | sha256sum -c -
+      - name: EmbeddingGemma forward parity
+        run: |
+          FRIEDFLAXIA_EMBED_GEMMA_GGUF="$MODEL_PATH" \
+            cargo test --release --test embeddinggemma -- --ignored --nocapture

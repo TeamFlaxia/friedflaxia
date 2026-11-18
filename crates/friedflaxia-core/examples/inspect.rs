@@ -59,8 +59,19 @@ fn main() {
     let mut entries: Vec<(&str, &Value)> = gguf.metadata_entries().collect();
     entries.sort_by_key(|(key, _)| *key);
     for (key, value) in entries {
-        if !matches!(value, Value::Array(_)) {
-            println!("kv {key} = {}", summarize(value));
+        if key.starts_with("tokenizer.ggml.") {
+            continue;
+        }
+        match value {
+            Value::Array(values) => {
+                let preview: Vec<String> = values.iter().take(8).map(summarize).collect();
+                println!(
+                    "kv {key} = array(len={}, first=[{}])",
+                    values.len(),
+                    preview.join(", ")
+                );
+            }
+            _ => println!("kv {key} = {}", summarize(value)),
         }
     }
 
