@@ -105,11 +105,57 @@ fn trunk_forward(
     token_ids: &[u32],
 ) -> Result<Vec<Vec<f32>>, ModelError> {
     let token_embd = tensor(gguf, file, "token_embd.weight")?;
-    let mut hidden: Vec<Vec<f32>> = token_ids
+    let hidden: Vec<Vec<f32>> = token_ids
         .iter()
         .map(|id| token_embd.row_vec(*id as usize))
         .collect::<Result<_, _>>()?;
+    trunk_forward_embeds(gguf, file, config, hidden)
+}
 
+/// Run the decision model with media prefix embeddings prepended to the text
+/// token embeddings.
+#[allow(clippy::too_many_arguments)]
+pub fn decision_logits_with_prefix(
+    gguf: &Gguf,
+    file: &[u8],
+    token_ids: &[u32],
+    marker_positions: &[usize],
+    qtype: usize,
+    prefix: &[f32],
+    prefix_rows: usize,
+) -> Result<Vec<f32>, ModelError> {
+    if token_ids.is_empty() {
+        return Err(ModelError::Invalid("token_ids must not be empty"));
+    }
+    if qtype >= DECISION_TYPES {
+        return Err(ModelError::Invalid("qtype must be 0..3"));
+    }
+    let config = D1Config::from_gguf(gguf)?;
+    if prefix_rows == 0 || prefix.len() != prefix_rows * config.n_embd {
+        return Err(ModelError::Shape("media prefix".into()));
+    }
+    let token_embd = tensor(gguf, file, "token_embd.weight")?;
+    let mut hidden: Vec<Vec<f32>> = Vec::with_capacity(prefix_rows + token_ids.len());
+    for row in prefix.chunks_exact(config.n_embd) {
+        hidden.push(row.to_vec());
+    }
+    for id in token_ids {
+        hidden.push(token_embd.row_vec(*id as usize)?);
+    }
+    let hidden = trunk_forward_embeds(gguf, file, &config, hidden)?;
+    let positions: Vec<usize> = marker_positions
+        .iter()
+        .map(|position| position + prefix_rows)
+        .collect();
+    decision_head(gguf, file, &config, hidden, &positions, qtype)
+}
+
+fn trunk_forward_embeds(
+    gguf: &Gguf,
+    file: &[u8],
+    config: &D1Config,
+    mut hidden: Vec<Vec<f32>>,
+) -> Result<Vec<Vec<f32>>, ModelError> {
     let n_layer_enc = config.n_layer - config.n_layer_decision;
     for layer in 0..n_layer_enc {
         let prefix = format!("blk.{layer}");
