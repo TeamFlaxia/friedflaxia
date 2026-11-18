@@ -1,4 +1,5 @@
 /target
 .cache
+crates/friedflaxia-wasm/pkg
 **/*.rs.bk
 .DS_Store
