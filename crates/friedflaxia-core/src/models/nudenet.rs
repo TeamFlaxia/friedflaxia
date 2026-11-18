@@ -37,6 +37,7 @@ pub const LABELS: [&str; NUDENET_CLASSES] = [
 #[derive(Debug, Clone, PartialEq)]
 pub struct Detection {
     pub label: &'static str,
+    pub label_index: usize,
     pub score: f32,
     pub box_xyxy: [f32; 4],
 }
@@ -492,6 +493,7 @@ fn nms(raw: &[f32], top_k: usize, iou_threshold: f32, score_threshold: f32) -> V
     kept.into_iter()
         .map(|(score, label, _, box_xyxy)| Detection {
             label: LABELS[label],
+            label_index: label,
             score,
             box_xyxy,
         })

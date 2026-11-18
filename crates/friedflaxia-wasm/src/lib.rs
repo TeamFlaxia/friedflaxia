@@ -7,6 +7,7 @@ use friedflaxia_core::gguf::tokenizer::{TokenizerError, TokenizerSpec};
 use friedflaxia_core::gguf::{Gguf, ParseOptions};
 use friedflaxia_core::models::d1omni::decision_logits;
 use friedflaxia_core::models::embeddinggemma::embed_text;
+use friedflaxia_core::models::nudenet::NudeNet;
 use friedflaxia_core::models::plamo3::{PlamoSession, next_token};
 use friedflaxia_core::tokenizer::{BpeTokenizer, UnigramTokenizer};
 use std::fmt;
@@ -93,6 +94,7 @@ enum ModelKind {
     EmbeddingGemma,
     D1Omni,
     Plamo3,
+    NudeNet,
 }
 
 impl ModelKind {
@@ -101,6 +103,7 @@ impl ModelKind {
             "gemma-embedding2" => Some(Self::EmbeddingGemma),
             "lfm2" => Some(Self::D1Omni),
             "plamo3" => Some(Self::Plamo3),
+            "yolov8-nudenet" => Some(Self::NudeNet),
             _ => None,
         }
     }
@@ -112,6 +115,7 @@ pub struct Engine {
     gguf: Gguf,
     kind: ModelKind,
     tokenizer: Option<Tokenizer>,
+    nudenet: Option<NudeNet>,
 }
 
 impl Engine {
@@ -136,11 +140,20 @@ impl Engine {
                         .map(|tokenizer| Tokenizer::Unigram(Box::new(tokenizer))),
                     _ => None,
                 });
+        let nudenet = if kind == ModelKind::NudeNet {
+            Some(
+                NudeNet::load(&gguf, &bytes)
+                    .map_err(|error| EngineError::new(error.to_string()))?,
+            )
+        } else {
+            None
+        };
         Ok(Self {
             bytes,
             gguf,
             kind,
             tokenizer,
+            nudenet,
         })
     }
 
@@ -231,6 +244,33 @@ impl Engine {
         }
         next_token(&self.gguf, &self.bytes, token_ids)
             .map_err(|error| EngineError::new(error.to_string()))
+    }
+
+    /// NudeNet detections as flattened `[x1, y1, x2, y2, score, label]` rows.
+    pub fn detect_nudenet(
+        &self,
+        input: &[f32],
+        top_k: u32,
+        iou_threshold: f32,
+        score_threshold: f32,
+    ) -> Result<Vec<f32>, EngineError> {
+        if self.kind != ModelKind::NudeNet {
+            return Err(EngineError::new("model is not yolov8-nudenet"));
+        }
+        let net = self
+            .nudenet
+            .as_ref()
+            .ok_or_else(|| EngineError::new("NudeNet model was not loaded"))?;
+        let detections = net
+            .detect(input, top_k as usize, iou_threshold, score_threshold)
+            .map_err(|error| EngineError::new(error.to_string()))?;
+        let mut flat = Vec::with_capacity(detections.len() * 6);
+        for detection in detections {
+            flat.extend_from_slice(&detection.box_xyxy);
+            flat.push(detection.score);
+            flat.push(detection.label_index as f32);
+        }
+        Ok(flat)
     }
 
     /// Generate up to `max_tokens` greedy tokens with the PLaMO KV cache.
@@ -354,6 +394,18 @@ impl Model {
     pub fn generate(&self, prompt_ids: &[u32], max_tokens: u32) -> Result<Vec<u32>, JsValue> {
         self.engine
             .generate(prompt_ids, max_tokens)
+            .map_err(js_error)
+    }
+
+    pub fn detect(
+        &self,
+        input: &[f32],
+        top_k: u32,
+        iou_threshold: f32,
+        score_threshold: f32,
+    ) -> Result<Vec<f32>, JsValue> {
+        self.engine
+            .detect_nudenet(input, top_k, iou_threshold, score_threshold)
             .map_err(js_error)
     }
 }
