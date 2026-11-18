@@ -44,7 +44,10 @@ Implemented and tested:
 - Tensor views with quantized row access
 - RMSNorm, LayerNorm, tanh/erf GELU, SiLU, softmax, NeoX/YaRN RoPE and pooling
 - **EmbeddingGemma 2 text forward pass**
-- **d1-omni decision forward pass**
+- **EmbeddingGemma 2 vision + audio encoders and multimodal fusion**
+- **d1-omni decision forward pass** (text, image and audio prefixes)
+- **d1-omni SigLIP2 vision tower and FastConformer audio encoder**
+- **NudeNet YOLOv8n 320 forward pass + class-agnostic NMS**
 - **PLaMO 3 Translate forward pass** (YaRN/full + plain/SWA RoPE, fused QKV,
   GQA, SwiGLU, post norms, greedy next-token)
 
@@ -56,6 +59,13 @@ Real-model parity:
 | EmbeddingGemma 2 Q8_0 | HF tokenizer IDs / decode | exact |
 | d1-omni Q8_0 | HF tokenizer IDs / decode | exact |
 | d1-omni Q8_0 | ONNX decision logits (3 qtypes) | max abs `0.022` |
+| EmbeddingGemma 2 + mmproj Q8_0 | vision encoder vs ONNX | max abs `0.16`, cosine `>0.9999` |
+| EmbeddingGemma 2 + mmproj Q8_0 | audio encoder vs ONNX | mean abs `0.06`, cosine `0.999` |
+| EmbeddingGemma 2 multimodal | end-to-end sentence embedding | cosine `0.9997` |
+| d1-omni mmproj Q8_0 | SigLIP2 vision vs ONNX | cosine `0.9997` |
+| d1-omni mmproj Q8_0 | FastConformer audio vs ONNX | cosine `0.9999` |
+| NudeNet 320n F32 | ONNX raw output | max abs `<0.0002` |
+| NudeNet 320n F32 | ONNX NonMaxSuppression | 100 selected boxes exact |
 | PLaMO 3 Translate Q4_0 | llama.cpp top-10 logits | exact top-10, max logit delta `<0.5` |
 | PLaMO 3 Translate Q4_0 | HF tokenizer IDs / decode | exact |
 
@@ -74,18 +84,18 @@ forward parity jobs.
 Additionally:
 
 - PLaMO KV cache (`PlamoSession`) with prefill + single-token decode
-- wasm-bindgen package (`friedflaxia-wasm`) with `Model`/`Engine`
+- wasm-bindgen package (`friedflaxia-wasm`) with `Model`, `MultimodalModel`
+  and `D1MultimodalModel`
 - Node smoke test against the real Q8_0 model
-- Crowd opt-in backends (draft PR): embed-gemma, text-only vector-embed,
-  d1 decision and PLaMO translation
+- Crowd uses FriedFlaxia for embed-gemma, vector-embed (text/image/audio),
+  d1 decisions (text/image/audio), PLaMO translation and NudeNet 320n.
 
 Next slices:
 
 1. Tensor range loader for streaming GGUF payloads
-2. Multimodal EmbeddingGemma (vision/audio encoders)
-3. NudeNet YOLOv8 + NMS (last ONNX dependency)
-4. Default flip in Crowd and ONNX dependency removal
-5. Further SIMD kernels and wasm size/load tuning
+2. MP4/WebM frame decoding for video vector-embeddings
+3. NudeNet 640m
+4. Further SIMD kernels and wasm size/load tuning
 
 ## wasm
 
