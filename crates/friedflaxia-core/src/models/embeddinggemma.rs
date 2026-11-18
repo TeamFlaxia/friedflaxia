@@ -96,23 +96,82 @@ fn required_u32(config: &ModelConfig<'_>, key: &str) -> Result<u32, ModelError> 
 /// The returned vector is mean-pooled and L2-normalized, matching the
 /// `sentence_embedding` output of the ONNX conversion.
 pub fn embed_text(gguf: &Gguf, file: &[u8], token_ids: &[u32]) -> Result<Vec<f32>, ModelError> {
+    embed_text_with_features(gguf, file, token_ids, &[], &[], &[])
+}
+
+/// Run the encoder over a sequence that contains image, video and audio soft
+/// tokens. Feature rows replace the corresponding placeholder token
+/// embeddings, in placeholder order.
+pub fn embed_text_with_features(
+    gguf: &Gguf,
+    file: &[u8],
+    token_ids: &[u32],
+    image_features: &[f32],
+    video_features: &[f32],
+    audio_features: &[f32],
+) -> Result<Vec<f32>, ModelError> {
     if token_ids.is_empty() {
         return Err(ModelError::Invalid("token_ids must not be empty"));
     }
+    const IMAGE_TOKEN: u32 = 258_880;
+    const AUDIO_TOKEN: u32 = 258_881;
+    const VIDEO_TOKEN: u32 = 258_884;
     let config = EmbeddingGemmaConfig::from_gguf(gguf)?;
     let token_embd = tensor(gguf, file, "token_embd.weight")?;
     if token_embd.cols() != config.n_embd {
         return Err(ModelError::Shape("token_embd columns".into()));
     }
+    let width = config.n_embd;
+    if image_features.len() % width != 0
+        || video_features.len() % width != 0
+        || audio_features.len() % width != 0
+    {
+        return Err(ModelError::Shape("multimodal feature width".into()));
+    }
+    let image_rows = image_features.len() / width;
+    let video_rows = video_features.len() / width;
+    let audio_rows = audio_features.len() / width;
+    let expected = |token: u32| token_ids.iter().filter(|id| **id == token).count();
+    if expected(IMAGE_TOKEN) != image_rows
+        || expected(VIDEO_TOKEN) != video_rows
+        || expected(AUDIO_TOKEN) != audio_rows
+    {
+        return Err(ModelError::Shape("multimodal feature count".into()));
+    }
 
     let input_scale = (config.n_embd as f32).sqrt();
     let mut hidden = Vec::with_capacity(token_ids.len());
+    let mut image_index = 0usize;
+    let mut video_index = 0usize;
+    let mut audio_index = 0usize;
     for token_id in token_ids {
         let mut row = token_embd.row_vec(*token_id as usize)?;
         for value in &mut row {
             *value *= input_scale;
         }
-        hidden.push(row);
+        let feature = match *token_id {
+            IMAGE_TOKEN => {
+                let start = image_index * width;
+                image_index += 1;
+                Some(&image_features[start..start + width])
+            }
+            VIDEO_TOKEN => {
+                let start = video_index * width;
+                video_index += 1;
+                Some(&video_features[start..start + width])
+            }
+            AUDIO_TOKEN => {
+                let start = audio_index * width;
+                audio_index += 1;
+                Some(&audio_features[start..start + width])
+            }
+            _ => None,
+        };
+        if let Some(feature) = feature {
+            hidden.push(feature.to_vec());
+        } else {
+            hidden.push(row);
+        }
     }
 
     let per_layer = build_per_layer_inputs(gguf, file, &config, &hidden)?;

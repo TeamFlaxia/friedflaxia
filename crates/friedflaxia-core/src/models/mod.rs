@@ -2,6 +2,8 @@
 
 pub mod d1omni;
 pub mod embeddinggemma;
+pub mod gemma_audio;
+pub mod gemma_vision;
 pub mod nudenet;
 pub mod plamo3;
 
