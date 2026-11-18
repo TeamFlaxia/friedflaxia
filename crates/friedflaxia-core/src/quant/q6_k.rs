@@ -27,7 +27,7 @@ pub fn dequantize_q6_k(bytes: &[u8]) -> Result<Vec<f32>, QuantError> {
             for l in 0..32usize {
                 let is = l / 16;
                 let qh_byte = qh[l];
-                let q1 = ((ql[l] & 0x0f) as i32 | (((qh_byte >> 0) & 3) as i32) << 4) - 32;
+                let q1 = ((ql[l] & 0x0f) as i32 | ((qh_byte & 3) as i32) << 4) - 32;
                 let q2 = ((ql[l + 32] & 0x0f) as i32 | (((qh_byte >> 2) & 3) as i32) << 4) - 32;
                 let q3 = ((ql[l] >> 4) as i32 | (((qh_byte >> 4) & 3) as i32) << 4) - 32;
                 let q4 = ((ql[l + 32] >> 4) as i32 | (((qh_byte >> 6) & 3) as i32) << 4) - 32;
