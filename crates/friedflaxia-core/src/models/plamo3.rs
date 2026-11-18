@@ -103,6 +103,231 @@ fn required_u32(config: &ModelConfig<'_>, key: &str) -> Result<u32, ModelError> 
         .ok_or_else(|| ModelError::Shape(format!("missing {key}")))
 }
 
+#[derive(Default)]
+struct LayerCache {
+    keys: Vec<Vec<f32>>,
+    values: Vec<Vec<f32>>,
+}
+
+/// Single-sequence PLaMO decoder with a persistent KV cache.
+pub struct PlamoSession<'a> {
+    gguf: &'a Gguf,
+    file: &'a [u8],
+    config: PlamoConfig,
+    layers: Vec<LayerCache>,
+    pos: usize,
+}
+
+impl<'a> PlamoSession<'a> {
+    pub fn new(gguf: &'a Gguf, file: &'a [u8]) -> Result<Self, ModelError> {
+        let config = PlamoConfig::from_gguf(gguf)?;
+        let layers = (0..config.n_layer).map(|_| LayerCache::default()).collect();
+        Ok(Self {
+            gguf,
+            file,
+            config,
+            layers,
+            pos: 0,
+        })
+    }
+
+    pub fn position(&self) -> usize {
+        self.pos
+    }
+
+    /// Feed every prompt token and return the final token's logits.
+    pub fn prefill(&mut self, token_ids: &[u32]) -> Result<Vec<f32>, ModelError> {
+        if token_ids.is_empty() {
+            return Err(ModelError::Invalid("token_ids must not be empty"));
+        }
+        let mut logits = Vec::new();
+        for token in token_ids {
+            logits = self.step(*token)?;
+        }
+        Ok(logits)
+    }
+
+    /// Decode one token and return its logits.
+    pub fn decode(&mut self, token: u32) -> Result<Vec<f32>, ModelError> {
+        self.step(token)
+    }
+
+    fn step(&mut self, token: u32) -> Result<Vec<f32>, ModelError> {
+        let token_embd = tensor(self.gguf, self.file, "token_embd.weight")?;
+        let mut hidden = token_embd.row_vec(token as usize)?;
+        let position = self.pos;
+
+        for layer in 0..self.config.n_layer {
+            let prefix = format!("blk.{layer}");
+            let attn_norm =
+                tensor(self.gguf, self.file, &format!("{prefix}.attn_norm.weight"))?.vec()?;
+            let wqkv = tensor(self.gguf, self.file, &format!("{prefix}.attn_qkv.weight"))?;
+            let q_norm = tensor(
+                self.gguf,
+                self.file,
+                &format!("{prefix}.attn_q_norm.weight"),
+            )?
+            .vec()?;
+            let k_norm = tensor(
+                self.gguf,
+                self.file,
+                &format!("{prefix}.attn_k_norm.weight"),
+            )?
+            .vec()?;
+            let wo = tensor(
+                self.gguf,
+                self.file,
+                &format!("{prefix}.attn_output.weight"),
+            )?;
+            let attn_post_norm = tensor(
+                self.gguf,
+                self.file,
+                &format!("{prefix}.post_attention_norm"),
+            )?
+            .vec()?;
+            let ffn_norm =
+                tensor(self.gguf, self.file, &format!("{prefix}.ffn_norm.weight"))?.vec()?;
+            let ffn_up = tensor(self.gguf, self.file, &format!("{prefix}.ffn_up.weight"))?;
+            let ffn_down = tensor(self.gguf, self.file, &format!("{prefix}.ffn_down.weight"))?;
+            let ffn_post_norm =
+                tensor(self.gguf, self.file, &format!("{prefix}.post_ffw_norm"))?.vec()?;
+
+            let (freq_base, freq_scale, ext_factor, attn_factor) = if self.config.swa_pattern[layer]
+            {
+                (self.config.rope_freq_base_swa, 1.0, 0.0, 1.0)
+            } else {
+                (
+                    self.config.rope_freq_base,
+                    self.config.rope_freq_scale,
+                    self.config.yarn_ext_factor,
+                    self.config.yarn_attn_factor,
+                )
+            };
+
+            let normed = rms_norm(&hidden, Some(&attn_norm), self.config.eps);
+            let qkv = wqkv.matvec(&normed)?;
+            let q_dim = self.config.n_head * self.config.head_dim;
+            let k_dim = self.config.n_head_kv * self.config.head_dim;
+            if qkv.len() != q_dim + k_dim + k_dim {
+                return Err(ModelError::Shape(format!("{prefix} qkv dimension")));
+            }
+            let mut q = qkv[..q_dim].to_vec();
+            let mut k = qkv[q_dim..q_dim + k_dim].to_vec();
+            let v = qkv[q_dim + k_dim..].to_vec();
+
+            for head in 0..self.config.n_head {
+                let start = head * self.config.head_dim;
+                let value = rms_norm(
+                    &q[start..start + self.config.head_dim],
+                    Some(&q_norm),
+                    self.config.eps,
+                );
+                q[start..start + self.config.head_dim].copy_from_slice(&value);
+            }
+            for head in 0..self.config.n_head_kv {
+                let start = head * self.config.head_dim;
+                let value = rms_norm(
+                    &k[start..start + self.config.head_dim],
+                    Some(&k_norm),
+                    self.config.eps,
+                );
+                k[start..start + self.config.head_dim].copy_from_slice(&value);
+            }
+
+            rope_neox_yarn_inplace(
+                &mut q,
+                self.config.n_head,
+                self.config.head_dim,
+                position,
+                freq_base,
+                freq_scale,
+                ext_factor,
+                attn_factor,
+                self.config.yarn_beta_fast,
+                self.config.yarn_beta_slow,
+                self.config.n_ctx_orig,
+            );
+            rope_neox_yarn_inplace(
+                &mut k,
+                self.config.n_head_kv,
+                self.config.head_dim,
+                position,
+                freq_base,
+                freq_scale,
+                ext_factor,
+                attn_factor,
+                self.config.yarn_beta_fast,
+                self.config.yarn_beta_slow,
+                self.config.n_ctx_orig,
+            );
+
+            self.layers[layer].keys.push(k);
+            self.layers[layer].values.push(v);
+
+            let start = if self.config.swa_pattern[layer] && self.config.n_swa > 0 {
+                position.saturating_sub(self.config.n_swa - 1)
+            } else {
+                0
+            };
+            let keys = &self.layers[layer].keys;
+            let values = &self.layers[layer].values;
+            let mut concat = vec![0.0f32; q_dim];
+            for head in 0..self.config.n_head {
+                let kv_head = head / (self.config.n_head / self.config.n_head_kv);
+                let mut scores: Vec<f32> = (start..=position)
+                    .map(|other| {
+                        q[head * self.config.head_dim..(head + 1) * self.config.head_dim]
+                            .iter()
+                            .zip(
+                                &keys[other][kv_head * self.config.head_dim
+                                    ..(kv_head + 1) * self.config.head_dim],
+                            )
+                            .map(|(q, k)| q * k)
+                            .sum::<f32>()
+                            / (self.config.head_dim as f32).sqrt()
+                    })
+                    .collect();
+                softmax_in_place(&mut scores);
+                let dest =
+                    &mut concat[head * self.config.head_dim..(head + 1) * self.config.head_dim];
+                for (weight, other) in scores.iter().zip(start..=position) {
+                    for (index, value) in values[other]
+                        [kv_head * self.config.head_dim..(kv_head + 1) * self.config.head_dim]
+                        .iter()
+                        .enumerate()
+                    {
+                        dest[index] += weight * value;
+                    }
+                }
+            }
+            let projected = wo.matvec(&concat)?;
+            let post = rms_norm(&projected, Some(&attn_post_norm), self.config.eps);
+            let residual = add(&hidden, &post);
+
+            let ffn_in = rms_norm(&residual, Some(&ffn_norm), self.config.eps);
+            let up = ffn_up.matvec(&ffn_in)?;
+            if up.len() != 2 * self.config.n_ff {
+                return Err(ModelError::Shape(format!("{prefix} ffn_up dimension")));
+            }
+            let activated: Vec<f32> = up[..self.config.n_ff]
+                .iter()
+                .zip(&up[self.config.n_ff..])
+                .map(|(gate, up)| silu(*gate) * up)
+                .collect();
+            let down = ffn_down.matvec(&activated)?;
+            let post = rms_norm(&down, Some(&ffn_post_norm), self.config.eps);
+            hidden = add(&residual, &post);
+        }
+
+        self.pos += 1;
+        let output_norm = tensor(self.gguf, self.file, "output_norm.weight")?.vec()?;
+        let normed = rms_norm(&hidden, Some(&output_norm), self.config.eps);
+        tensor(self.gguf, self.file, "output.weight")?
+            .matvec(&normed)
+            .map_err(Into::into)
+    }
+}
+
 /// Greedy next-token id for the final prompt position.
 pub fn next_token(gguf: &Gguf, file: &[u8], token_ids: &[u32]) -> Result<u32, ModelError> {
     let logits = last_token_logits(gguf, file, token_ids)?;

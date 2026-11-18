@@ -1,5 +1,5 @@
 use friedflaxia_core::gguf::{Gguf, ParseOptions};
-use friedflaxia_core::models::plamo3::last_token_logits;
+use friedflaxia_core::models::plamo3::{PlamoSession, last_token_logits};
 use std::env;
 use std::fs;
 
@@ -48,4 +48,25 @@ fn plamo_last_token_logits_match_llama_cpp() {
             "token {id} logit difference {difference} is too large"
         );
     }
+
+    let mut session = PlamoSession::new(&gguf, &file).expect("session");
+    let cached = session.prefill(&PROMPT_IDS).expect("cached prefill");
+    let mut cached_top: Vec<usize> = (0..cached.len()).collect();
+    cached_top.sort_by(|a, b| cached[*b].partial_cmp(&cached[*a]).unwrap());
+    assert_eq!(&cached_top[..10], &GOLDEN_TOP10, "cached prefill top-10");
+
+    let next = GOLDEN_TOP10[0] as u32;
+    let cached_next = session.decode(next).expect("cached decode");
+    let mut with_next = PROMPT_IDS.to_vec();
+    with_next.push(next);
+    let full_next = last_token_logits(&gguf, &file, &with_next).expect("full next logits");
+    let max_difference = cached_next
+        .iter()
+        .zip(&full_next)
+        .map(|(cached, full)| (cached - full).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_difference < 1e-3,
+        "cached decode differs from full forward by {max_difference}"
+    );
 }
