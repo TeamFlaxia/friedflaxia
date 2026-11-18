@@ -184,10 +184,10 @@ pub fn matvec_q6_k(
                     let q4 = ((ql[l + 32] >> 4) as i32 | (((qh_byte >> 6) & 3) as i32) << 4) - 32;
 
                     let offset = input_base + n * 128 + l;
-                    sum += d * scales[is] as f32 * q1 as f32 * input[offset];
-                    sum += d * scales[is + 2] as f32 * q2 as f32 * input[offset + 32];
-                    sum += d * scales[is + 4] as f32 * q3 as f32 * input[offset + 64];
-                    sum += d * scales[is + 6] as f32 * q4 as f32 * input[offset + 96];
+                    sum += d * scales[is] as i8 as f32 * q1 as f32 * input[offset];
+                    sum += d * scales[is + 2] as i8 as f32 * q2 as f32 * input[offset + 32];
+                    sum += d * scales[is + 4] as i8 as f32 * q3 as f32 * input[offset + 64];
+                    sum += d * scales[is + 6] as i8 as f32 * q4 as f32 * input[offset + 96];
                 }
             }
         }

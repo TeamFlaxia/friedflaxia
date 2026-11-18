@@ -37,13 +37,16 @@ Implemented and tested:
 - GGUF v2/v3 metadata and tensor-index parser, with tokenizer metadata skipping
 - Q4_0, Q4_1, Q6_K, Q8_0 and BF16 dequantization, plus F16 scale decoding
 - Quantized matrix-vector kernels for Q4_0/Q4_1/Q6_K/Q8_0/F32/BF16
-- GGUF tokenizer metadata and BPE encode/decode for `gpt2` and `gemma4`
+- GGUF tokenizer metadata and tokenizers:
+  - BPE for `gpt2` (d1-omni) and `gemma4` (EmbeddingGemma 2)
+  - Unigram for `plamo3` (PLaMO 3 Translate)
 - Architecture-scoped configuration reader
-- Tensor views with row access for quantized token embeddings
-- RMSNorm, LayerNorm, tanh/erf GELU, SiLU, softmax, NeoX RoPE and pooling
+- Tensor views with quantized row access
+- RMSNorm, LayerNorm, tanh/erf GELU, SiLU, softmax, NeoX/YaRN RoPE and pooling
 - **EmbeddingGemma 2 text forward pass**
-- **d1-omni decision forward pass** (16-layer LFM2 encoder + 2-layer head,
-  short-convolution/attention layers, marker scoring and three question types)
+- **d1-omni decision forward pass**
+- **PLaMO 3 Translate forward pass** (YaRN/full + plain/SWA RoPE, fused QKV,
+  GQA, SwiGLU, post norms, greedy next-token)
 
 Real-model parity:
 
@@ -53,24 +56,29 @@ Real-model parity:
 | EmbeddingGemma 2 Q8_0 | HF tokenizer IDs / decode | exact |
 | d1-omni Q8_0 | HF tokenizer IDs / decode | exact |
 | d1-omni Q8_0 | ONNX decision logits (3 qtypes) | max abs `0.022` |
+| PLaMO 3 Translate Q4_0 | llama.cpp top-10 logits | exact top-10, max logit delta `<0.5` |
+| PLaMO 3 Translate Q4_0 | HF tokenizer IDs / decode | exact |
 
 ```sh
 FRIEDFLAXIA_EMBED_GEMMA_GGUF=/path/embeddinggemma-2-Q8_0.gguf \
   cargo test --release --test embeddinggemma -- --ignored --nocapture
 FRIEDFLAXIA_D1_GGUF=/path/d1-omni-600M-Q8_0.gguf \
   cargo test --release --test d1omni -- --ignored --nocapture
+FRIEDFLAXIA_PLAMO_GGUF=/path/plamo-3-translate-0.8b-Q4_0.gguf \
+  cargo test --release --test plamo3 -- --ignored --nocapture
 ```
 
-CI downloads both pinned GGUF files, verifies their SHA-256, then runs tokenizer
-and forward parity jobs.
+CI downloads each pinned GGUF, verifies its SHA-256, then runs the tokenizer and
+forward parity jobs.
 
 Next slices:
 
-1. PLaMO 3 Translate tokenizer (Unigram) and generation forward
-2. Tensor range loader for streaming GGUF payloads
-3. wasm-bindgen package for the browser node
-4. Crowd integration (`embed-gemma`/`vector-embed` first)
-5. NudeNet YOLOv8 + NMS
+1. KV cache for PLaMO generation (remove full-prefix recomputation)
+2. Tokenizer encode path for EmbeddingGemma/d1 host prompts (already covered by goldens)
+3. Tensor range loader for streaming GGUF payloads
+4. wasm-bindgen package for the browser node
+5. Crowd integration (`embed-gemma`/`vector-embed` first)
+6. NudeNet YOLOv8 + NMS
 
 ## Development
 

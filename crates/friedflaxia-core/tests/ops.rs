@@ -1,6 +1,6 @@
 use friedflaxia_core::ops::{
-    gelu_erf, gelu_tanh, l2_normalize, layer_norm, rms_norm, rope_neox_inplace, silu,
-    softmax_in_place,
+    gelu_erf, gelu_tanh, l2_normalize, layer_norm, rms_norm, rope_neox_inplace,
+    rope_neox_yarn_inplace, silu, softmax_in_place,
 };
 
 fn assert_close(actual: f32, expected: f32, tolerance: f32) {
@@ -72,6 +72,17 @@ fn rope_neox_rotates_at_the_requested_position() {
     rope_neox_inplace(&mut at_one, 1, 2, 1, 10_000.0);
     assert_close(at_one[0], 1.0f32.cos(), 1e-6);
     assert_close(at_one[1], 1.0f32.sin(), 1e-6);
+}
+
+#[test]
+fn yarn_rope_reduces_to_standard_rope_when_disabled() {
+    let mut standard = vec![1.0, 0.0];
+    rope_neox_inplace(&mut standard, 1, 2, 1, 10_000.0);
+
+    let mut yarn = vec![1.0, 0.0];
+    rope_neox_yarn_inplace(&mut yarn, 1, 2, 1, 10_000.0, 1.0, 0.0, 1.0, 32.0, 1.0, 4096);
+    assert_close(yarn[0], standard[0], 1e-6);
+    assert_close(yarn[1], standard[1], 1e-6);
 }
 
 #[test]

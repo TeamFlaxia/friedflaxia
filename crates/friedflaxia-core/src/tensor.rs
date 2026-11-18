@@ -2,8 +2,8 @@
 
 use crate::gguf::{Gguf, GgufError, TensorInfo, TensorType};
 use crate::quant::{
-    MatvecError, QuantError, dequantize_bf16, dequantize_q4_0, dequantize_q8_0, matvec_bf16,
-    matvec_f32, matvec_q4_0, matvec_q4_1, matvec_q6_k, matvec_q8_0,
+    MatvecError, QuantError, dequantize_bf16, dequantize_q4_0, dequantize_q6_k, dequantize_q8_0,
+    matvec_bf16, matvec_f32, matvec_q4_0, matvec_q4_1, matvec_q6_k, matvec_q8_0,
 };
 use std::fmt;
 
@@ -90,6 +90,11 @@ impl<'a> TensorView<'a> {
             TensorType::Q8_0 => {
                 let block_bytes = elements / 32 * 34;
                 dequantize_q8_0(&self.bytes[offset / 32 * 34..offset / 32 * 34 + block_bytes])
+                    .map_err(TensorError::Quant)?
+            }
+            TensorType::Q6K => {
+                let block_bytes = elements / 256 * 210;
+                dequantize_q6_k(&self.bytes[offset / 256 * 210..offset / 256 * 210 + block_bytes])
                     .map_err(TensorError::Quant)?
             }
             other => return Err(TensorError::UnsupportedType(other)),

@@ -87,3 +87,32 @@ jobs:
             cargo test --release --test bpe_real d1_tokenizer -- --ignored --nocapture
           FRIEDFLAXIA_D1_GGUF="$MODEL_PATH" \
             cargo test --release --test d1omni -- --ignored --nocapture
+
+  plamo-parity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      MODEL_URL: https://huggingface.co/pfnet/plamo-3-translate-0.8b-GGUF/resolve/main/plamo-3-translate-0.8b-Q4_0.gguf
+      MODEL_SHA256: 33deed2822f799de4d15bb03bea1ac40efa7d663d9239ee54cc7f65f5ab92917
+      MODEL_PATH: ${{ github.workspace }}/.cache/plamo-3-translate-0.8b-Q4_0.gguf
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache the pinned PLaMO GGUF
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.cache/plamo-3-translate-0.8b-Q4_0.gguf
+          key: plamo-q4_0-${{ env.MODEL_SHA256 }}
+      - name: Download and verify the GGUF
+        run: |
+          mkdir -p "$(dirname "$MODEL_PATH")"
+          if [ ! -f "$MODEL_PATH" ]; then
+            curl -fL --retry 3 --retry-delay 2 -o "$MODEL_PATH" "$MODEL_URL"
+          fi
+          echo "$MODEL_SHA256  $MODEL_PATH" | sha256sum -c -
+      - name: PLaMO tokenizer and logits parity
+        run: |
+          FRIEDFLAXIA_PLAMO_GGUF="$MODEL_PATH" \
+            cargo test --release --test unigram_real -- --ignored --nocapture
+          FRIEDFLAXIA_PLAMO_GGUF="$MODEL_PATH" \
+            cargo test --release --test plamo3 -- --ignored --nocapture

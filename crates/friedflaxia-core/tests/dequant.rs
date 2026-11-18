@@ -101,6 +101,13 @@ fn q6_k_block_uses_six_bit_values_and_signed_scales() {
     assert_eq!(values[32], -32.0);
     assert_eq!(values[64], -32.0);
     assert_eq!(values[96], -32.0);
+
+    // Scales are signed int8: -2 * -32 = 64.
+    block[0] = 0;
+    block[128] = 0;
+    block[192..208].fill(-2i8 as u8);
+    let values = dequantize_q6_k(&block).expect("one complete Q6_K block");
+    assert!(values.iter().all(|value| *value == 64.0));
 }
 
 #[test]

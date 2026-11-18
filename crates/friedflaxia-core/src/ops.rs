@@ -113,6 +113,69 @@ pub fn rope_neox_inplace(
     }
 }
 
+/// NeoX RoPE with the YaRN interpolation used by PLaMO 3.
+#[allow(clippy::too_many_arguments)]
+pub fn rope_neox_yarn_inplace(
+    x: &mut [f32],
+    n_heads: usize,
+    head_dim: usize,
+    pos: usize,
+    freq_base: f32,
+    freq_scale: f32,
+    ext_factor: f32,
+    attn_factor: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+    n_ctx_orig: usize,
+) {
+    if n_heads == 0 || head_dim < 2 {
+        return;
+    }
+    debug_assert_eq!(x.len(), n_heads * head_dim);
+    debug_assert_eq!(head_dim % 2, 0);
+    let half = head_dim / 2;
+    let corr_low = yarn_corr_dim(head_dim, n_ctx_orig, beta_fast, freq_base).max(0.0);
+    let corr_high =
+        yarn_corr_dim(head_dim, n_ctx_orig, beta_slow, freq_base).min((head_dim - 1) as f32);
+    let mscale = if ext_factor != 0.0 {
+        attn_factor * (1.0 + 0.1 * (1.0 / freq_scale).ln())
+    } else {
+        attn_factor
+    };
+
+    let mut cos = vec![0.0f32; half];
+    let mut sin = vec![0.0f32; half];
+    for (index, (cos, sin)) in cos.iter_mut().zip(sin.iter_mut()).enumerate() {
+        let i0 = index * 2;
+        let theta_extrap = pos as f32 * freq_base.powf(-(i0 as f32) / head_dim as f32);
+        let theta_interp = freq_scale * theta_extrap;
+        let ramp_mix = yarn_ramp(corr_low, corr_high, i0) * ext_factor;
+        let theta = theta_interp * (1.0 - ramp_mix) + theta_extrap * ramp_mix;
+        *cos = theta.cos() * mscale;
+        *sin = theta.sin() * mscale;
+    }
+
+    for head in 0..n_heads {
+        let base = head * head_dim;
+        for index in 0..half {
+            let x0 = x[base + index];
+            let x1 = x[base + half + index];
+            x[base + index] = x0 * cos[index] - x1 * sin[index];
+            x[base + half + index] = x1 * cos[index] + x0 * sin[index];
+        }
+    }
+}
+
+fn yarn_corr_dim(n_dims: usize, n_ctx_orig: usize, n_rot: f32, base: f32) -> f32 {
+    n_dims as f32 * (n_ctx_orig as f32 / (n_rot * 2.0 * std::f32::consts::PI)).ln()
+        / (2.0 * base.ln())
+}
+
+fn yarn_ramp(low: f32, high: f32, i0: usize) -> f32 {
+    let y = (i0 as f32 / 2.0 - low) / (high - low).max(0.001);
+    1.0 - y.clamp(0.0, 1.0)
+}
+
 /// L2-normalize a vector, leaving an all-zero vector unchanged.
 pub fn l2_normalize(values: &[f32]) -> Vec<f32> {
     let norm = values.iter().map(|value| value * value).sum::<f32>().sqrt();

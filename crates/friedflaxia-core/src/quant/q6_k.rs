@@ -33,10 +33,10 @@ pub fn dequantize_q6_k(bytes: &[u8]) -> Result<Vec<f32>, QuantError> {
                 let q4 = ((ql[l + 32] >> 4) as i32 | (((qh_byte >> 6) & 3) as i32) << 4) - 32;
 
                 let offset = base + n * 128 + l;
-                out[offset] = d * scales[is] as f32 * q1 as f32;
-                out[offset + 32] = d * scales[is + 2] as f32 * q2 as f32;
-                out[offset + 64] = d * scales[is + 4] as f32 * q3 as f32;
-                out[offset + 96] = d * scales[is + 6] as f32 * q4 as f32;
+                out[offset] = d * scales[is] as i8 as f32 * q1 as f32;
+                out[offset + 32] = d * scales[is + 2] as i8 as f32 * q2 as f32;
+                out[offset + 64] = d * scales[is + 4] as i8 as f32 * q3 as f32;
+                out[offset + 96] = d * scales[is + 6] as i8 as f32 * q4 as f32;
             }
         }
     }

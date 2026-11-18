@@ -1,8 +1,10 @@
 //! Tokenizers reconstructed from GGUF metadata.
 
 mod bpe;
+mod unigram;
 
 pub use bpe::BpeTokenizer;
+pub use unigram::UnigramTokenizer;
 
 use crate::gguf::tokenizer::TokenizerError;
 
