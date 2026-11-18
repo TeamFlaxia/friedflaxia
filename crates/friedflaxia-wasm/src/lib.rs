@@ -6,7 +6,9 @@
 use friedflaxia_core::gguf::tokenizer::{TokenizerError, TokenizerSpec};
 use friedflaxia_core::gguf::{Gguf, ParseOptions};
 use friedflaxia_core::models::d1omni::decision_logits;
-use friedflaxia_core::models::embeddinggemma::embed_text;
+use friedflaxia_core::models::embeddinggemma::{embed_text, embed_text_with_features};
+use friedflaxia_core::models::gemma_audio::encode_audio;
+use friedflaxia_core::models::gemma_vision::encode_image;
 use friedflaxia_core::models::nudenet::NudeNet;
 use friedflaxia_core::models::plamo3::{PlamoSession, next_token};
 use friedflaxia_core::tokenizer::{BpeTokenizer, UnigramTokenizer};
@@ -407,6 +409,107 @@ impl Model {
         self.engine
             .detect_nudenet(input, top_k, iou_threshold, score_threshold)
             .map_err(js_error)
+    }
+}
+
+/// Multimodal EmbeddingGemma 2 model: text GGUF plus the vision/audio mmproj.
+#[wasm_bindgen]
+pub struct MultimodalModel {
+    text_bytes: Vec<u8>,
+    text_gguf: Gguf,
+    mmproj_bytes: Vec<u8>,
+    mmproj: Gguf,
+    tokenizer: Option<Tokenizer>,
+}
+
+#[wasm_bindgen]
+impl MultimodalModel {
+    #[wasm_bindgen(constructor)]
+    pub fn new(text_bytes: Vec<u8>, mmproj_bytes: Vec<u8>) -> Result<MultimodalModel, JsValue> {
+        let text_gguf = Gguf::parse_with_options(&text_bytes, ParseOptions::default())
+            .map_err(|error| js_error(error.to_string()))?;
+        let architecture = text_gguf
+            .metadata("general.architecture")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| js_error("text GGUF has no general.architecture"))?;
+        if architecture != "gemma-embedding2" {
+            return Err(js_error(format!(
+                "expected gemma-embedding2 text GGUF, got {architecture}"
+            )));
+        }
+        let mmproj = Gguf::parse_with_options(&mmproj_bytes, ParseOptions::default())
+            .map_err(|error| js_error(error.to_string()))?;
+        let mmproj_arch = mmproj
+            .metadata("general.architecture")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| js_error("mmproj GGUF has no general.architecture"))?;
+        if mmproj_arch != "clip" {
+            return Err(js_error(format!(
+                "expected clip mmproj GGUF, got {mmproj_arch}"
+            )));
+        }
+        let tokenizer =
+            TokenizerSpec::from_gguf(&text_gguf)
+                .ok()
+                .and_then(|spec| match spec.model.as_str() {
+                    "gpt2" | "gemma4" => BpeTokenizer::from_spec(&spec)
+                        .ok()
+                        .map(|tokenizer| Tokenizer::Bpe(Box::new(tokenizer))),
+                    _ => None,
+                });
+        Ok(Self {
+            text_bytes,
+            text_gguf,
+            mmproj_bytes,
+            mmproj,
+            tokenizer,
+        })
+    }
+
+    pub fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>, JsValue> {
+        self.tokenizer
+            .as_ref()
+            .ok_or_else(|| js_error("text GGUF has no supported tokenizer"))?
+            .encode(text, add_special_tokens)
+            .map_err(js_error)
+    }
+
+    pub fn encode_image(
+        &self,
+        patches: &[f32],
+        grid_h: u32,
+        grid_w: u32,
+    ) -> Result<Vec<f32>, JsValue> {
+        encode_image(
+            &self.mmproj,
+            &self.mmproj_bytes,
+            patches,
+            grid_h as usize,
+            grid_w as usize,
+        )
+        .map_err(js_error)
+    }
+
+    pub fn encode_audio(&self, mel: &[f32], frames: u32) -> Result<Vec<f32>, JsValue> {
+        encode_audio(&self.mmproj, &self.mmproj_bytes, mel, frames as usize).map_err(js_error)
+    }
+
+    pub fn embed(
+        &self,
+        token_ids: &[u32],
+        image_features: &[f32],
+        video_features: &[f32],
+        audio_features: &[f32],
+    ) -> Result<Vec<f32>, JsValue> {
+        embed_text_with_features(
+            &self.text_gguf,
+            &self.text_bytes,
+            token_ids,
+            image_features,
+            video_features,
+            audio_features,
+        )
+        .map_err(js_error)
     }
 }
 
