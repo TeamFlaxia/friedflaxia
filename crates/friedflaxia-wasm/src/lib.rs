@@ -474,6 +474,14 @@ impl MultimodalModel {
             .map_err(js_error)
     }
 
+    pub fn bos_token_id(&self) -> Option<u32> {
+        self.tokenizer.as_ref().map(Tokenizer::bos_token_id)
+    }
+
+    pub fn eos_token_id(&self) -> Option<u32> {
+        self.tokenizer.as_ref().map(Tokenizer::eos_token_id)
+    }
+
     pub fn encode_image(
         &self,
         patches: &[f32],
