@@ -171,6 +171,10 @@ pub enum TokenizerError {
     WrongType(&'static str),
     LengthMismatch(&'static str),
     InvalidTokenType(i32),
+    UnsupportedModel(String),
+    InvalidMerge(String),
+    InvalidPattern(String),
+    InvalidTokenId(u32),
 }
 
 impl fmt::Display for TokenizerError {
@@ -180,6 +184,10 @@ impl fmt::Display for TokenizerError {
             Self::WrongType(key) => write!(f, "tokenizer metadata {key} has the wrong type"),
             Self::LengthMismatch(key) => write!(f, "tokenizer metadata {key} has the wrong length"),
             Self::InvalidTokenType(value) => write!(f, "unknown GGUF token type {value}"),
+            Self::UnsupportedModel(model) => write!(f, "unsupported GGUF tokenizer model {model}"),
+            Self::InvalidMerge(merge) => write!(f, "invalid BPE merge {merge:?}"),
+            Self::InvalidPattern(error) => write!(f, "invalid tokenizer pattern: {error}"),
+            Self::InvalidTokenId(id) => write!(f, "invalid token id {id}"),
         }
     }
 }

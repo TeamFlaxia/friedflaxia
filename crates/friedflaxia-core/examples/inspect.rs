@@ -64,7 +64,7 @@ fn main() {
         }
         match value {
             Value::Array(values) => {
-                let preview: Vec<String> = values.iter().take(8).map(summarize).collect();
+                let preview: Vec<String> = values.iter().take(32).map(summarize).collect();
                 println!(
                     "kv {key} = array(len={}, first=[{}])",
                     values.len(),

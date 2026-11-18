@@ -17,6 +17,42 @@ pub fn rms_norm(input: &[f32], weight: Option<&[f32]>, eps: f32) -> Vec<f32> {
         .collect()
 }
 
+/// LayerNorm with weight and bias.
+pub fn layer_norm(input: &[f32], weight: &[f32], bias: &[f32], eps: f32) -> Vec<f32> {
+    if input.is_empty() {
+        return Vec::new();
+    }
+    let mean = input.iter().sum::<f32>() / input.len() as f32;
+    let variance = input
+        .iter()
+        .map(|value| {
+            let centered = value - mean;
+            centered * centered
+        })
+        .sum::<f32>()
+        / input.len() as f32;
+    let inv_std = 1.0 / (variance + eps).sqrt();
+    input
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let scale = weight.get(index).copied().unwrap_or(1.0);
+            let shift = bias.get(index).copied().unwrap_or(0.0);
+            (value - mean) * inv_std * scale + shift
+        })
+        .collect()
+}
+
+/// Sigmoid-linear unit.
+pub fn silu(value: f32) -> f32 {
+    value / (1.0 + (-value).exp())
+}
+
+/// GELU with the exact erf formulation used by the d1 decision scorer.
+pub fn gelu_erf(value: f32) -> f32 {
+    0.5 * value * (1.0 + libm::erff(value / std::f32::consts::SQRT_2))
+}
+
 /// GELU with the tanh approximation used by Gemma-family models.
 pub fn gelu_tanh(value: f32) -> f32 {
     const SQRT_2_OVER_PI: f32 = 0.797_884_6;

@@ -1,5 +1,6 @@
 use friedflaxia_core::ops::{
-    gelu_tanh, l2_normalize, rms_norm, rope_neox_inplace, softmax_in_place,
+    gelu_erf, gelu_tanh, l2_normalize, layer_norm, rms_norm, rope_neox_inplace, silu,
+    softmax_in_place,
 };
 
 fn assert_close(actual: f32, expected: f32, tolerance: f32) {
@@ -25,6 +26,26 @@ fn gelu_tanh_matches_the_reference_values() {
     assert_close(gelu_tanh(1.0), 0.841_192, 1e-5);
     assert_close(gelu_tanh(-1.0), -0.158_808, 1e-5);
     assert_close(gelu_tanh(8.0), 8.0, 1e-3);
+}
+
+#[test]
+fn layer_norm_uses_mean_variance_and_bias() {
+    let out = layer_norm(&[1.0, 2.0, 3.0, 4.0], &[1.0; 4], &[0.0; 4], 0.0);
+    assert_close(out[0], -1.341_640_8, 1e-5);
+    assert_close(out[1], -0.447_213_6, 1e-5);
+    assert_close(out[2], 0.447_213_6, 1e-5);
+    assert_close(out[3], 1.341_640_8, 1e-5);
+
+    let out = layer_norm(&[1.0, 1.0], &[2.0, 2.0], &[0.5, -0.5], 1e-6);
+    assert_eq!(out, vec![0.5, -0.5]);
+}
+
+#[test]
+fn silu_and_gelu_erf_match_reference_values() {
+    assert_eq!(silu(0.0), 0.0);
+    assert_close(silu(1.0), 0.731_058_6, 1e-6);
+    assert_close(gelu_erf(1.0), 0.841_344_7, 1e-6);
+    assert_close(gelu_erf(-1.0), -0.158_655_3, 1e-6);
 }
 
 #[test]

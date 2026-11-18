@@ -1,5 +1,6 @@
 //! Model forward passes built on GGUF tensors.
 
+pub mod d1omni;
 pub mod embeddinggemma;
 
 use crate::gguf::ConfigError;

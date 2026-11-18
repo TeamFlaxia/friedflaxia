@@ -9,3 +9,4 @@ pub mod models;
 pub mod ops;
 pub mod quant;
 pub mod tensor;
+pub mod tokenizer;
