@@ -71,14 +71,29 @@ FRIEDFLAXIA_PLAMO_GGUF=/path/plamo-3-translate-0.8b-Q4_0.gguf \
 CI downloads each pinned GGUF, verifies its SHA-256, then runs the tokenizer and
 forward parity jobs.
 
+Additionally:
+
+- PLaMO KV cache (`PlamoSession`) with prefill + single-token decode
+- wasm-bindgen package (`friedflaxia-wasm`) with `Model`/`Engine`
+- Node smoke test against the real Q8_0 model
+- Crowd opt-in backends (draft PR): embed-gemma, text-only vector-embed,
+  d1 decision and PLaMO translation
+
 Next slices:
 
-1. KV cache for PLaMO generation (remove full-prefix recomputation)
-2. Tokenizer encode path for EmbeddingGemma/d1 host prompts (already covered by goldens)
-3. Tensor range loader for streaming GGUF payloads
-4. wasm-bindgen package for the browser node
-5. Crowd integration (`embed-gemma`/`vector-embed` first)
-6. NudeNet YOLOv8 + NMS
+1. Tensor range loader for streaming GGUF payloads
+2. Multimodal EmbeddingGemma (vision/audio encoders)
+3. NudeNet YOLOv8 + NMS (last ONNX dependency)
+4. Default flip in Crowd and ONNX dependency removal
+5. Further SIMD kernels and wasm size/load tuning
+
+## wasm
+
+```sh
+./scripts/build-wasm.sh web          # browser ESM package
+./scripts/build-wasm.sh nodejs /tmp/friedflaxia-nodejs
+node scripts/wasm-smoke.cjs /tmp/friedflaxia-nodejs /path/embeddinggemma-2-Q8_0.gguf
+```
 
 ## Development
 
