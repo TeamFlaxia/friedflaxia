@@ -1,0 +1,12 @@
+[workspace]
+members = ["crates/friedflaxia-core"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/TeamFlaxia/friedflaxia"
+rust-version = "1.85"
+
+[workspace.dependencies]
+friedflaxia-core = { path = "crates/friedflaxia-core" }
