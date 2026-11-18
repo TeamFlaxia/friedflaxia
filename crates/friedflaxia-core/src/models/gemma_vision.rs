@@ -57,38 +57,6 @@ impl GemmaVisionConfig {
     }
 }
 
-/// Debug helper: return the patch+position embedding rows.
-#[doc(hidden)]
-pub fn debug_image_embedding(
-    gguf: &Gguf,
-    file: &[u8],
-    patches: &[f32],
-    grid_h: usize,
-    grid_w: usize,
-) -> Result<Vec<f32>, ModelError> {
-    let config = GemmaVisionConfig::from_gguf(gguf)?;
-    let hidden = image_embedding(gguf, file, &config, patches, grid_h, grid_w)?;
-    Ok(hidden.into_iter().flatten().collect())
-}
-
-/// Debug helper: run the first `layers` ViT blocks and return their rows.
-#[doc(hidden)]
-pub fn debug_image_layers(
-    gguf: &Gguf,
-    file: &[u8],
-    patches: &[f32],
-    grid_h: usize,
-    grid_w: usize,
-    layers: usize,
-) -> Result<Vec<f32>, ModelError> {
-    let config = GemmaVisionConfig::from_gguf(gguf)?;
-    let mut hidden = image_embedding(gguf, file, &config, patches, grid_h, grid_w)?;
-    for layer in 0..layers.min(config.n_layer) {
-        hidden = run_layer(gguf, file, &config, layer, hidden, grid_w)?;
-    }
-    Ok(hidden.into_iter().flatten().collect())
-}
-
 /// Encode a patch grid into `[soft_tokens, output_dim]` rows.
 ///
 /// `patches` is row-major over `(row, column)` and every row holds

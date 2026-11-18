@@ -1,5 +1,5 @@
 use friedflaxia_core::gguf::{Gguf, ParseOptions};
-use friedflaxia_core::models::d1_vision::{debug_image_embedding, encode_image};
+use friedflaxia_core::models::d1_vision::encode_image;
 use std::env;
 use std::fs;
 
@@ -53,23 +53,4 @@ fn d1_vision_matches_onnx() {
         mean_abs < 0.15,
         "vision differs from ONNX (mean {mean_abs})"
     );
-}
-
-#[test]
-#[ignore = "requires FRIEDFLAXIA_D1_MMPROJ"]
-fn d1_vision_embedding_matches_onnx() {
-    let Ok(path) = env::var("FRIEDFLAXIA_D1_MMPROJ") else {
-        eprintln!("skipping");
-        return;
-    };
-    let file = fs::read(path).expect("read mmproj");
-    let gguf = Gguf::parse_with_options(
-        &file,
-        ParseOptions {
-            skip_tokenizer: true,
-        },
-    )
-    .expect("parse mmproj");
-    let actual = debug_image_embedding(&gguf, &file, &floats(PATCHES), 32, 32).expect("embedding");
-    println!("first8 {:?}", &actual[..8]);
 }
