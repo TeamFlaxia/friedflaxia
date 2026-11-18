@@ -10,6 +10,7 @@ use std::fmt;
 mod reader;
 mod value;
 
+pub mod tokenizer;
 pub use value::{TensorType, Value};
 
 use reader::Reader;

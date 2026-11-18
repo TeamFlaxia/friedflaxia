@@ -1,5 +1,6 @@
 use friedflaxia_core::quant::{
-    Q4_0_BLOCK_BYTES, Q8_0_BLOCK_BYTES, dequantize_bf16, dequantize_q4_0, dequantize_q8_0,
+    Q4_0_BLOCK_BYTES, Q4_1_BLOCK_BYTES, Q6_K_BLOCK_BYTES, Q8_0_BLOCK_BYTES, dequantize_bf16,
+    dequantize_q4_0, dequantize_q4_1, dequantize_q6_k, dequantize_q8_0,
 };
 
 /// IEEE-754 binary16 bit patterns used by the GGML block headers.
@@ -59,6 +60,47 @@ fn zero_scale_produces_zeroes() {
             .iter()
             .all(|value| *value == 0.0)
     );
+}
+
+#[test]
+fn q4_1_block_applies_scale_and_min() {
+    let mut block = [0u8; Q4_1_BLOCK_BYTES];
+    block[..2].copy_from_slice(&F16_1_0.to_le_bytes());
+    block[2..4].copy_from_slice(&F16_0_5.to_le_bytes());
+    for j in 0..16usize {
+        let low = j as u8 & 0x0f;
+        let high = (15 - j) as u8 & 0x0f;
+        block[4 + j] = low | (high << 4);
+    }
+
+    let values = dequantize_q4_1(&block).expect("one complete Q4_1 block");
+    assert_eq!(values.len(), 32);
+    for j in 0..16usize {
+        assert_eq!(values[j], j as f32 + 0.5);
+        assert_eq!(values[16 + j], (15 - j) as f32 + 0.5);
+    }
+}
+
+#[test]
+fn q6_k_block_uses_six_bit_values_and_signed_scales() {
+    let mut block = [0u8; Q6_K_BLOCK_BYTES];
+    // ql=0 and qh=0 encode q=-32 everywhere; d=1 and every scale=1.
+    block[208..210].copy_from_slice(&F16_1_0.to_le_bytes());
+    for scale in &mut block[192..208] {
+        *scale = 1;
+    }
+    let values = dequantize_q6_k(&block).expect("one complete Q6_K block");
+    assert_eq!(values.len(), 256);
+    assert!(values.iter().all(|value| *value == -32.0));
+
+    // Encode 31 at output[0]: ql[0] low nibble = 15, qh[0] bits 0..1 = 3.
+    block[0] = 0x0f;
+    block[128] = 0b0000_0011;
+    let values = dequantize_q6_k(&block).expect("one complete Q6_K block");
+    assert_eq!(values[0], 31.0);
+    assert_eq!(values[32], -32.0);
+    assert_eq!(values[64], -32.0);
+    assert_eq!(values[96], -32.0);
 }
 
 #[test]

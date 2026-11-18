@@ -13,6 +13,7 @@ fn q8_0_and_q4_0_byte_lengths_match_ggml_blocks() {
     assert_eq!(TensorType::Q8_0.byte_len(64), Some(68));
     assert_eq!(TensorType::Q4_0.byte_len(64), Some(36));
     assert_eq!(TensorType::Q4_0.byte_len(33), Some(36));
+    assert_eq!(TensorType::Q4_1.byte_len(64), Some(40));
     assert_eq!(TensorType::Q8_0.byte_len(0), Some(0));
 }
 

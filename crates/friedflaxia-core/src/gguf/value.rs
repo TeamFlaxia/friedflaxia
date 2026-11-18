@@ -174,4 +174,26 @@ impl Value {
     pub fn as_u32(&self) -> Option<u32> {
         self.as_u64().and_then(|value| u32::try_from(value).ok())
     }
+
+    pub fn as_i32(&self) -> Option<i32> {
+        match self {
+            Self::I8(value) => Some(*value as i32),
+            Self::I16(value) => Some(*value as i32),
+            Self::I32(value) => Some(*value),
+            Self::I64(value) => i32::try_from(*value).ok(),
+            Self::U8(value) => Some(*value as i32),
+            Self::U16(value) => Some(*value as i32),
+            Self::U32(value) => i32::try_from(*value).ok(),
+            Self::U64(value) => i32::try_from(*value).ok(),
+            _ => None,
+        }
+    }
+
+    pub fn as_f32(&self) -> Option<f32> {
+        match self {
+            Self::F32(value) => Some(*value),
+            Self::F64(value) => Some(*value as f32),
+            _ => None,
+        }
+    }
 }

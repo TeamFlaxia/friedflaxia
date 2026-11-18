@@ -1,3 +1,4 @@
+use friedflaxia_core::gguf::tokenizer::TokenizerSpec;
 use friedflaxia_core::gguf::{Gguf, TensorType, Value};
 use std::env;
 use std::fs;
@@ -37,6 +38,22 @@ fn main() {
         if let Some(value) = gguf.metadata(key) {
             println!("meta {key} = {}", summarize(value));
         }
+    }
+
+    if let Ok(tokenizer) = TokenizerSpec::from_gguf(&gguf) {
+        println!(
+            "tokenizer model={} vocab={} scores={} merges={} bos={} eos={} add_bos={} add_eos={}",
+            tokenizer.model,
+            tokenizer.vocab_size(),
+            tokenizer.scores.len(),
+            tokenizer.merges.len(),
+            tokenizer.bos_token_id,
+            tokenizer.eos_token_id,
+            tokenizer.add_bos_token,
+            tokenizer.add_eos_token
+        );
+    } else if gguf.metadata("tokenizer.ggml.tokens").is_some() {
+        println!("tokenizer metadata present but not readable");
     }
 
     for tensor in gguf.tensors() {
