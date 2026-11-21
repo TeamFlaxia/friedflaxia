@@ -112,6 +112,13 @@ Next slices:
 3. NudeNet 640m
 4. Further SIMD kernels and wasm size/load tuning
 
+## Theia dLLM denoise (design)
+
+Theia runs small masked-diffusion LMs across Crowd nodes and merges their
+per-position token distributions. The proposed `denoise_step` API, the reusable
+bidirectional/all-position substrate, and the concrete blockers are documented
+in [docs/dllm-denoise.md](docs/dllm-denoise.md).
+
 ## wasm
 
 ```sh
