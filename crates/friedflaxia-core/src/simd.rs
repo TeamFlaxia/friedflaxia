@@ -29,10 +29,15 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     if !is_enabled() || a.len() < 8 {
         return dot_scalar(a, b);
     }
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     {
-        // `simd128` is enabled by build-wasm.sh and checked in CI.
+        // `simd128` is enabled by build-wasm.sh for the default artifact.
         unsafe { dot_wasm(a.as_ptr(), b, a.len()) }
+    }
+    #[cfg(all(target_arch = "wasm32", not(target_feature = "simd128")))]
+    {
+        // The baseline wasm fallback has no SIMD instructions at all.
+        dot_scalar(a, b)
     }
     #[cfg(all(target_arch = "x86_64", not(target_arch = "wasm32")))]
     {
@@ -73,9 +78,13 @@ pub fn dot_f32_le_bytes(bytes: &[u8], b: &[f32]) -> f32 {
             })
             .sum();
     }
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     {
         unsafe { dot_wasm(bytes.as_ptr().cast(), b, len) }
+    }
+    #[cfg(all(target_arch = "wasm32", not(target_feature = "simd128")))]
+    {
+        dot_scalar_bytes(bytes, b)
     }
     #[cfg(all(target_arch = "x86_64", not(target_arch = "wasm32")))]
     {
@@ -104,9 +113,13 @@ pub fn sum(a: &[f32]) -> f32 {
     if !is_enabled() || a.len() < 8 {
         return a.iter().sum();
     }
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     {
         unsafe { sum_wasm(a) }
+    }
+    #[cfg(all(target_arch = "wasm32", not(target_feature = "simd128")))]
+    {
+        a.iter().sum()
     }
     #[cfg(all(target_arch = "x86_64", not(target_arch = "wasm32")))]
     {
@@ -134,14 +147,6 @@ fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
-#[cfg(any(
-    not(any(
-        target_arch = "wasm32",
-        target_arch = "x86_64",
-        target_arch = "aarch64"
-    )),
-    all(target_arch = "x86_64", not(target_arch = "wasm32"))
-))]
 fn dot_scalar_bytes(bytes: &[u8], b: &[f32]) -> f32 {
     bytes
         .chunks_exact(4)
@@ -151,6 +156,7 @@ fn dot_scalar_bytes(bytes: &[u8], b: &[f32]) -> f32 {
 }
 
 #[cfg(target_arch = "wasm32")]
+#[target_feature(enable = "simd128")]
 unsafe fn dot_wasm(a: *const f32, b: &[f32], len: usize) -> f32 {
     use core::arch::wasm32::{f32x4_add, f32x4_extract_lane, f32x4_mul, v128_load};
 
@@ -195,6 +201,7 @@ unsafe fn dot_wasm(a: *const f32, b: &[f32], len: usize) -> f32 {
 }
 
 #[cfg(target_arch = "wasm32")]
+#[target_feature(enable = "simd128")]
 unsafe fn sum_wasm(a: &[f32]) -> f32 {
     use core::arch::wasm32::{f32x4_add, f32x4_extract_lane, v128_load};
 
