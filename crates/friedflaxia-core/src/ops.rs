@@ -1,11 +1,18 @@
-//! Scalar building blocks shared by the model forward passes.
+//! Building blocks shared by the model forward passes.
+
+use crate::simd;
 
 /// RMSNorm with an optional elementwise weight.
 pub fn rms_norm(input: &[f32], weight: Option<&[f32]>, eps: f32) -> Vec<f32> {
     if input.is_empty() {
         return Vec::new();
     }
-    let mean_square = input.iter().map(|value| value * value).sum::<f32>() / input.len() as f32;
+    let sum_of_squares = if simd::is_enabled() {
+        simd::dot(input, input)
+    } else {
+        input.iter().map(|value| value * value).sum::<f32>()
+    };
+    let mean_square = sum_of_squares / input.len() as f32;
     let inv_rms = 1.0 / (mean_square + eps).sqrt();
     input
         .iter()

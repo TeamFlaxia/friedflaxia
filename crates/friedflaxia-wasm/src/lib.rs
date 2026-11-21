@@ -650,6 +650,13 @@ impl D1MultimodalModel {
     }
 }
 
+/// Fall back to the scalar kernels when a device shows a parity regression.
+/// The vendored wasm is built with SIMD enabled by default.
+#[wasm_bindgen]
+pub fn set_simd_enabled(enabled: bool) {
+    friedflaxia_core::simd::set_enabled(enabled);
+}
+
 fn js_error(error: impl fmt::Display) -> JsValue {
     JsValue::from_str(&error.to_string())
 }

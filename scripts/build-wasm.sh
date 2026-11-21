@@ -6,7 +6,10 @@ TARGET="${1:-web}"
 OUT_DIR="${2:-$ROOT/crates/friedflaxia-wasm/pkg}"
 
 cd "$ROOT"
-cargo build --release --target wasm32-unknown-unknown -p friedflaxia-wasm
+# The scalar fallback still exists for bit-exact comparisons, but the shipped
+# artifact uses wasm SIMD. Keep this flag in sync with the vendored manifest.
+RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+simd128" \
+  cargo build --release --target wasm32-unknown-unknown -p friedflaxia-wasm
 rm -rf "$OUT_DIR"
 wasm-bindgen \
   --target "$TARGET" \

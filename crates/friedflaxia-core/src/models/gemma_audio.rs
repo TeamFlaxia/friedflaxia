@@ -10,7 +10,7 @@ use crate::gguf::Gguf;
 use crate::ops::{rms_norm, silu, softmax_in_place};
 use crate::tensor::{TensorView, tensor};
 
-const MEL_BINS: usize = 128;
+use crate::manifest::MEL_BINS;
 const SUBSAMPLE_CHANNELS: [usize; 2] = [128, 32];
 const CHUNK: usize = 12;
 const PAST: usize = 12;

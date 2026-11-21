@@ -7,6 +7,7 @@
 use super::{
     Q4_0_BLOCK_BYTES, Q4_1_BLOCK_BYTES, Q6_K_BLOCK_BYTES, Q8_0_BLOCK_BYTES, QK, QK_K, f16_to_f32,
 };
+use crate::simd;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,10 +85,20 @@ pub fn matvec_q8_0(
         for block in 0..blocks {
             let bytes = &row_bytes[block * Q8_0_BLOCK_BYTES..(block + 1) * Q8_0_BLOCK_BYTES];
             let scale = f16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]]));
-            let mut dot = 0.0f32;
-            for i in 0..QK {
-                dot += (bytes[2 + i] as i8) as f32 * input[block * QK + i];
-            }
+            let input_block = &input[block * QK..(block + 1) * QK];
+            let dot = if simd::is_enabled() {
+                let mut dequantized = [0.0f32; QK];
+                for (index, value) in dequantized.iter_mut().enumerate() {
+                    *value = (bytes[2 + index] as i8) as f32;
+                }
+                simd::dot(&dequantized, input_block)
+            } else {
+                let mut dot = 0.0f32;
+                for index in 0..QK {
+                    dot += (bytes[2 + index] as i8) as f32 * input_block[index];
+                }
+                dot
+            };
             sum += scale * dot;
         }
         out.push(sum);
@@ -109,12 +120,24 @@ pub fn matvec_q4_0(
         for block in 0..blocks {
             let bytes = &row_bytes[block * Q4_0_BLOCK_BYTES..(block + 1) * Q4_0_BLOCK_BYTES];
             let scale = f16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]]));
-            let mut dot = 0.0f32;
-            for j in 0..QK / 2 {
-                let packed = bytes[2 + j];
-                dot += ((packed & 0x0f) as i8 - 8) as f32 * input[block * QK + j];
-                dot += ((packed >> 4) as i8 - 8) as f32 * input[block * QK + QK / 2 + j];
-            }
+            let input_block = &input[block * QK..(block + 1) * QK];
+            let dot = if simd::is_enabled() {
+                let mut dequantized = [0.0f32; QK];
+                for j in 0..QK / 2 {
+                    let packed = bytes[2 + j];
+                    dequantized[j] = ((packed & 0x0f) as i8 - 8) as f32;
+                    dequantized[QK / 2 + j] = ((packed >> 4) as i8 - 8) as f32;
+                }
+                simd::dot(&dequantized, input_block)
+            } else {
+                let mut dot = 0.0f32;
+                for j in 0..QK / 2 {
+                    let packed = bytes[2 + j];
+                    dot += ((packed & 0x0f) as i8 - 8) as f32 * input_block[j];
+                    dot += ((packed >> 4) as i8 - 8) as f32 * input_block[QK / 2 + j];
+                }
+                dot
+            };
             sum += scale * dot;
         }
         out.push(sum);
@@ -137,14 +160,26 @@ pub fn matvec_q4_1(
             let bytes = &row_bytes[block * Q4_1_BLOCK_BYTES..(block + 1) * Q4_1_BLOCK_BYTES];
             let scale = f16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]]));
             let min = f16_to_f32(u16::from_le_bytes([bytes[2], bytes[3]]));
-            let mut dot = 0.0f32;
-            let mut input_sum = 0.0f32;
-            for j in 0..QK / 2 {
-                let packed = bytes[4 + j];
-                dot += (packed & 0x0f) as f32 * input[block * QK + j];
-                dot += (packed >> 4) as f32 * input[block * QK + QK / 2 + j];
-                input_sum += input[block * QK + j] + input[block * QK + QK / 2 + j];
-            }
+            let input_block = &input[block * QK..(block + 1) * QK];
+            let (dot, input_sum) = if simd::is_enabled() {
+                let mut dequantized = [0.0f32; QK];
+                for j in 0..QK / 2 {
+                    let packed = bytes[4 + j];
+                    dequantized[j] = (packed & 0x0f) as f32;
+                    dequantized[QK / 2 + j] = (packed >> 4) as f32;
+                }
+                (simd::dot(&dequantized, input_block), simd::sum(input_block))
+            } else {
+                let mut dot = 0.0f32;
+                let mut input_sum = 0.0f32;
+                for j in 0..QK / 2 {
+                    let packed = bytes[4 + j];
+                    dot += (packed & 0x0f) as f32 * input_block[j];
+                    dot += (packed >> 4) as f32 * input_block[QK / 2 + j];
+                    input_sum += input_block[j] + input_block[QK / 2 + j];
+                }
+                (dot, input_sum)
+            };
             sum += scale * dot + min * input_sum;
         }
         out.push(sum);
@@ -223,17 +258,23 @@ pub fn matvec_f32(
     }
     let mut out = Vec::with_capacity(rows);
     for row in 0..rows {
-        let mut sum = 0.0f32;
-        for (col, input_value) in input.iter().copied().enumerate() {
-            let offset = (row * cols + col) * 4;
-            let value = f32::from_le_bytes([
-                weights[offset],
-                weights[offset + 1],
-                weights[offset + 2],
-                weights[offset + 3],
-            ]);
-            sum += value * input_value;
-        }
+        let row_bytes = &weights[row * cols * 4..(row + 1) * cols * 4];
+        let sum = if simd::is_enabled() {
+            simd::dot_f32_le_bytes(row_bytes, input)
+        } else {
+            let mut sum = 0.0f32;
+            for (col, input_value) in input.iter().copied().enumerate() {
+                let offset = col * 4;
+                let value = f32::from_le_bytes([
+                    row_bytes[offset],
+                    row_bytes[offset + 1],
+                    row_bytes[offset + 2],
+                    row_bytes[offset + 3],
+                ]);
+                sum += value * input_value;
+            }
+            sum
+        };
         out.push(sum);
     }
     Ok(out)
@@ -265,13 +306,28 @@ pub fn matvec_bf16(
         });
     }
     let mut out = Vec::with_capacity(rows);
+    let mut scratch = if simd::is_enabled() {
+        vec![0.0f32; cols]
+    } else {
+        Vec::new()
+    };
     for row in 0..rows {
-        let mut sum = 0.0f32;
-        for (col, input_value) in input.iter().copied().enumerate() {
-            let offset = (row * cols + col) * 2;
-            let bits = u16::from_le_bytes([weights[offset], weights[offset + 1]]);
-            sum += f32::from_bits((bits as u32) << 16) * input_value;
-        }
+        let sum = if simd::is_enabled() {
+            for (col, value) in scratch.iter_mut().enumerate() {
+                let offset = (row * cols + col) * 2;
+                let bits = u16::from_le_bytes([weights[offset], weights[offset + 1]]);
+                *value = f32::from_bits((bits as u32) << 16);
+            }
+            simd::dot(&scratch, input)
+        } else {
+            let mut sum = 0.0f32;
+            for (col, input_value) in input.iter().copied().enumerate() {
+                let offset = (row * cols + col) * 2;
+                let bits = u16::from_le_bytes([weights[offset], weights[offset + 1]]);
+                sum += f32::from_bits((bits as u32) << 16) * input_value;
+            }
+            sum
+        };
         out.push(sum);
     }
     Ok(out)

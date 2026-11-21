@@ -6,11 +6,11 @@ use crate::ops::{gelu_erf, layer_norm, silu, softmax_in_place};
 use crate::tensor::tensor;
 use std::f32::consts::PI;
 
-const SAMPLE_RATE: usize = 16_000;
-const N_FFT: usize = 512;
+use crate::manifest::{FFT_LENGTH, HOP_LENGTH, MEL_BINS, SAMPLE_RATE};
+
+const N_FFT: usize = FFT_LENGTH;
 const WINDOW: usize = 400;
-const HOP: usize = 160;
-const MEL_BINS: usize = 128;
+const HOP: usize = HOP_LENGTH;
 const MIN_SAMPLES: usize = 8_000;
 const MAX_SAMPLES: usize = 30 * SAMPLE_RATE;
 const CHANNELS: usize = 256;

@@ -93,7 +93,7 @@ Additionally:
 Next slices:
 
 1. Tensor range loader for streaming GGUF payloads
-2. MP4/WebM frame decoding for video vector-embeddings
+2. WebM frame decoding for video vector-embeddings
 3. NudeNet 640m
 4. Further SIMD kernels and wasm size/load tuning
 

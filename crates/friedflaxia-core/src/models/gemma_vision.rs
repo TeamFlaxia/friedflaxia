@@ -10,7 +10,7 @@ use crate::gguf::Gguf;
 use crate::ops::{gelu_tanh, rms_norm, softmax_in_place};
 use crate::tensor::tensor;
 
-const PATCH_SIZE: usize = 16;
+use crate::manifest::PATCH_SIZE;
 const PATCH_DIM: usize = PATCH_SIZE * PATCH_SIZE * 3;
 const POOL: usize = 3;
 const ROPE_THETA: f32 = 100.0;

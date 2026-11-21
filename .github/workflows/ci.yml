@@ -29,12 +29,18 @@ jobs:
           targets: wasm32-unknown-unknown
       - name: Build for wasm32
         run: cargo build --target wasm32-unknown-unknown
+      - name: Install wasm-bindgen CLI
+        run: cargo install wasm-bindgen-cli --version 0.2.130 --locked
+      - name: Build the wasm-bindgen package
+        # The generated package is what flaxia-crowd vendors, so CI must
+        # exercise the same wasm-bindgen step as scripts/build-wasm.sh.
+        run: ./scripts/build-wasm.sh web "$RUNNER_TEMP/friedflaxia-pkg"
 
   embeddinggemma-parity:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      MODEL_URL: https://huggingface.co/unsloth/embeddinggemma-2-GGUF/resolve/main/embeddinggemma-2-Q8_0.gguf
+      MODEL_URL: https://huggingface.co/unsloth/embeddinggemma-2-GGUF/resolve/031f0d4b35536f69ab3509d4893c923264fcf253/embeddinggemma-2-Q8_0.gguf
       MODEL_SHA256: 6f1bd4ac6c5df7444f9cca7ca36cafe6cfa34cd6f49fefb1e0b4be8143aed8bc
       MODEL_PATH: ${{ github.workspace }}/.cache/embeddinggemma-2-Q8_0.gguf
     steps:
@@ -63,7 +69,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      MODEL_URL: https://huggingface.co/LiquidAI/d1-omni-600M-GGUF/resolve/main/d1-omni-600M-Q8_0.gguf
+      MODEL_URL: https://huggingface.co/LiquidAI/d1-omni-600M-GGUF/resolve/8eb2d2a1c5404bba8a34a88bd8e159c242197d51/d1-omni-600M-Q8_0.gguf
       MODEL_SHA256: cd94463f4cac9c700ec6750df8df005bb6846de410e159d1f5e985e1171693d3
       MODEL_PATH: ${{ github.workspace }}/.cache/d1-omni-600M-Q8_0.gguf
     steps:
@@ -108,9 +114,9 @@ jobs:
         run: |
           mkdir -p .cache
           test -f .cache/embeddinggemma-2-Q8_0.gguf || curl -fL --retry 3 -o .cache/embeddinggemma-2-Q8_0.gguf \
-            https://huggingface.co/unsloth/embeddinggemma-2-GGUF/resolve/main/embeddinggemma-2-Q8_0.gguf
+            https://huggingface.co/unsloth/embeddinggemma-2-GGUF/resolve/031f0d4b35536f69ab3509d4893c923264fcf253/embeddinggemma-2-Q8_0.gguf
           test -f .cache/mmproj-embeddinggemma-2-Q8_0.gguf || curl -fL --retry 3 -o .cache/mmproj-embeddinggemma-2-Q8_0.gguf \
-            https://huggingface.co/ggml-org/embeddinggemma-2-GGUF/resolve/main/mmproj-embeddinggemma-2-Q8_0.gguf
+            https://huggingface.co/ggml-org/embeddinggemma-2-GGUF/resolve/6ea3e3a309d12a4779cfda98b8c19800d2d5da71/mmproj-embeddinggemma-2-Q8_0.gguf
           echo "$TEXT_SHA256  .cache/embeddinggemma-2-Q8_0.gguf" | sha256sum -c -
           echo "$MMPROJ_SHA256  .cache/mmproj-embeddinggemma-2-Q8_0.gguf" | sha256sum -c -
       - name: Vision, audio and end-to-end parity
@@ -143,7 +149,7 @@ jobs:
         run: |
           mkdir -p .cache
           test -f .cache/mmproj-d1-omni-600M-Q8_0.gguf || curl -fL --retry 3 -o .cache/mmproj-d1-omni-600M-Q8_0.gguf \
-            https://huggingface.co/LiquidAI/d1-omni-600M-GGUF/resolve/main/mmproj-d1-omni-600M-Q8_0.gguf
+            https://huggingface.co/LiquidAI/d1-omni-600M-GGUF/resolve/8eb2d2a1c5404bba8a34a88bd8e159c242197d51/mmproj-d1-omni-600M-Q8_0.gguf
           echo "$MMPROJ_SHA256  .cache/mmproj-d1-omni-600M-Q8_0.gguf" | sha256sum -c -
       - name: d1 vision and audio parity
         run: |
@@ -178,7 +184,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
-      MODEL_URL: https://huggingface.co/pfnet/plamo-3-translate-0.8b-GGUF/resolve/main/plamo-3-translate-0.8b-Q4_0.gguf
+      MODEL_URL: https://huggingface.co/pfnet/plamo-3-translate-0.8b-GGUF/resolve/1cf96ae02133958a20074bfdfab76517bb737d00/plamo-3-translate-0.8b-Q4_0.gguf
       MODEL_SHA256: 33deed2822f799de4d15bb03bea1ac40efa7d663d9239ee54cc7f65f5ab92917
       MODEL_PATH: ${{ github.workspace }}/.cache/plamo-3-translate-0.8b-Q4_0.gguf
     steps:
