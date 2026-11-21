@@ -15,7 +15,10 @@ use friedflaxia_core::models::nudenet::NudeNet;
 use friedflaxia_core::models::plamo3::{PlamoSession, next_token};
 use friedflaxia_core::tokenizer::{BpeTokenizer, UnigramTokenizer};
 use std::fmt;
+use std::future::Future;
+use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen_futures::JsFuture;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineError {
@@ -307,6 +310,48 @@ impl Engine {
         }
         Ok(generated)
     }
+
+    /// Like [`Engine::generate`], but awaits `on_token` after every decoded
+    /// token. The callback can therefore apply backpressure and cancellation
+    /// from JS between steps instead of receiving one opaque buffer at the end.
+    pub async fn generate_stream_async<F, Fut>(
+        &self,
+        prompt_ids: &[u32],
+        max_tokens: u32,
+        mut on_token: F,
+    ) -> Result<Vec<u32>, EngineError>
+    where
+        F: FnMut(u32) -> Fut,
+        Fut: Future<Output = Result<(), EngineError>>,
+    {
+        if self.kind != ModelKind::Plamo3 {
+            return Err(EngineError::new("model is not plamo3"));
+        }
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| EngineError::new("GGUF has no supported tokenizer"))?;
+        let limit = max_tokens.min(4096);
+        let mut session = PlamoSession::new(&self.gguf, &self.bytes)
+            .map_err(|error| EngineError::new(error.to_string()))?;
+        let mut logits = session
+            .prefill(prompt_ids)
+            .map_err(|error| EngineError::new(error.to_string()))?;
+        let eos = tokenizer.eos_token_id();
+        let mut generated = Vec::new();
+        for _ in 0..limit {
+            let next = argmax(&logits)?;
+            if next == eos || tokenizer.is_control(next) {
+                break;
+            }
+            generated.push(next);
+            on_token(next).await?;
+            logits = session
+                .decode(next)
+                .map_err(|error| EngineError::new(error.to_string()))?;
+        }
+        Ok(generated)
+    }
 }
 
 fn argmax(values: &[f32]) -> Result<u32, EngineError> {
@@ -398,6 +443,31 @@ impl Model {
     pub fn generate(&self, prompt_ids: &[u32], max_tokens: u32) -> Result<Vec<u32>, JsValue> {
         self.engine
             .generate(prompt_ids, max_tokens)
+            .map_err(js_error)
+    }
+
+    /// Stream greedy tokens to `on_token(token_id)`. The callback may return a
+    /// Promise; generation waits for it before decoding the next token, so the
+    /// host can pause, cancel or throttle the stream.
+    pub async fn generate_stream(
+        &self,
+        prompt_ids: &[u32],
+        max_tokens: u32,
+        on_token: &js_sys::Function,
+    ) -> Result<Vec<u32>, JsValue> {
+        self.engine
+            .generate_stream_async(prompt_ids, max_tokens, |token| {
+                let callback = on_token.call1(&JsValue::NULL, &JsValue::from_f64(token as f64));
+                async move {
+                    let value = callback.map_err(|error| EngineError::new(format!("{error:?}")))?;
+                    let promise: js_sys::Promise = value.unchecked_into();
+                    JsFuture::from(promise)
+                        .await
+                        .map_err(|error| EngineError::new(format!("{error:?}")))?;
+                    Ok(())
+                }
+            })
+            .await
             .map_err(js_error)
     }
 
