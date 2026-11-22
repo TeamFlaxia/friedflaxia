@@ -2,6 +2,10 @@
 
 use friedflaxia_core::quant::{matvec_q4_0, matvec_q8_0};
 use friedflaxia_core::simd;
+use std::sync::Mutex;
+
+/// `set_enabled` is process-global, so the parity tests must not overlap.
+static SIMD_LOCK: Mutex<()> = Mutex::new(());
 
 fn q8_0_block(scale_bits: u16, values: &[i8; 32]) -> Vec<u8> {
     let mut block = Vec::from(scale_bits.to_le_bytes());
@@ -25,6 +29,7 @@ fn assert_close(left: &[f32], right: &[f32]) {
 
 #[test]
 fn q8_0_simd_matches_scalar() {
+    let _guard = SIMD_LOCK.lock().unwrap();
     let input: Vec<f32> = (0..64).map(|index| (index as f32 - 32.0) / 32.0).collect();
     let mut weights = Vec::new();
     for block in 0..6 {
@@ -43,6 +48,7 @@ fn q8_0_simd_matches_scalar() {
 
 #[test]
 fn q4_0_simd_matches_scalar() {
+    let _guard = SIMD_LOCK.lock().unwrap();
     let input: Vec<f32> = (0..64).map(|index| (index as f32 - 32.0) / 32.0).collect();
     let mut weights = Vec::new();
     for _ in 0..8 {
@@ -60,6 +66,7 @@ fn q4_0_simd_matches_scalar() {
 
 #[test]
 fn dot_handles_tail_elements() {
+    let _guard = SIMD_LOCK.lock().unwrap();
     let a: Vec<f32> = (0..19).map(|index| index as f32 * 0.25).collect();
     let b: Vec<f32> = (0..19).map(|index| 1.0 - index as f32 * 0.01).collect();
     let expected: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
