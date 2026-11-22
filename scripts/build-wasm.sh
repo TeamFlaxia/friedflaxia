@@ -15,7 +15,11 @@ FEATURES=""
 if [ "$SIMD" = "1" ]; then
   FEATURES="-C target-feature=+simd128"
 fi
-RUSTFLAGS="${RUSTFLAGS:-} ${FEATURES}" \
+# Panic locations embed absolute source paths. Remap them so a local build and
+# CI produce the same bytes, which the vendoring check compares by SHA-256.
+CARGO_HOME_DIR="${CARGO_HOME:-$HOME/.cargo}"
+REMAP="--remap-path-prefix=${CARGO_HOME_DIR}=/cargo --remap-path-prefix=${ROOT}=/friedflaxia"
+RUSTFLAGS="${RUSTFLAGS:-} ${FEATURES} ${REMAP}" \
   cargo build --release --target wasm32-unknown-unknown -p friedflaxia-wasm
 rm -rf "$OUT_DIR"
 wasm-bindgen \
