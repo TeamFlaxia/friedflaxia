@@ -9,12 +9,13 @@ use friedflaxia_core::models::d1_audio::encode_audio as encode_d1_audio;
 use friedflaxia_core::models::d1_vision::encode_image as encode_d1_image;
 use friedflaxia_core::models::d1omni::{decision_logits, decision_logits_with_prefix};
 use friedflaxia_core::models::dllm::{
-    DenoiseStepOutput, DenoiseTopKOutput, denoise_step as dllm_denoise_step,
-    denoise_topk as dllm_denoise_topk,
+    DenoiseStepOutput, DenoiseTopKOutput, DllmConfig, denoise_step_with_lora as dllm_denoise_step,
+    denoise_topk_with_lora as dllm_denoise_topk,
 };
 use friedflaxia_core::models::embeddinggemma::{embed_text, embed_text_with_features};
 use friedflaxia_core::models::gemma_audio::encode_audio;
 use friedflaxia_core::models::gemma_vision::encode_image;
+use friedflaxia_core::models::lora::LoraModel;
 use friedflaxia_core::models::nudenet::NudeNet;
 use friedflaxia_core::models::plamo3::{PlamoSession, next_token};
 use friedflaxia_core::tokenizer::{BpeTokenizer, UnigramTokenizer};
@@ -129,6 +130,7 @@ pub struct Engine {
     kind: ModelKind,
     tokenizer: Option<Tokenizer>,
     nudenet: Option<NudeNet>,
+    lora: Option<LoraModel>,
 }
 
 impl Engine {
@@ -167,7 +169,35 @@ impl Engine {
             kind,
             tokenizer,
             nudenet,
+            lora: None,
         })
+    }
+
+    /// Load a base dLLM plus a LoRA adapter.
+    pub fn with_lora(bytes: Vec<u8>, lora_bytes: Vec<u8>) -> Result<Self, EngineError> {
+        let mut engine = Self::new(bytes)?;
+        if engine.kind != ModelKind::Dllm {
+            return Err(EngineError::new("LoRA adapters require a qwen3-dllm model"));
+        }
+        let config = DllmConfig::from_gguf(&engine.gguf)
+            .map_err(|error| EngineError::new(error.to_string()))?;
+        let lora_gguf = Gguf::parse_with_options(&lora_bytes, ParseOptions::default())
+            .map_err(|error| EngineError::new(error.to_string()))?;
+        let lora = LoraModel::from_gguf(lora_gguf, lora_bytes, config.n_layer)
+            .map_err(|error| EngineError::new(error.to_string()))?;
+        engine.lora = Some(lora);
+        Ok(engine)
+    }
+
+    pub fn lora_rank(&self) -> Option<usize> {
+        self.lora.as_ref().map(LoraModel::rank)
+    }
+
+    pub fn lora_expert(&self) -> Option<String> {
+        self.lora
+            .as_ref()
+            .and_then(LoraModel::expert)
+            .map(str::to_owned)
     }
 
     pub fn architecture(&self) -> &str {
@@ -269,8 +299,15 @@ impl Engine {
         if self.kind != ModelKind::Dllm {
             return Err(EngineError::new("model is not qwen3-dllm"));
         }
-        dllm_denoise_step(&self.gguf, &self.bytes, tokens, positions, block)
-            .map_err(|error| EngineError::new(error.to_string()))
+        dllm_denoise_step(
+            &self.gguf,
+            &self.bytes,
+            tokens,
+            positions,
+            block,
+            self.lora.as_ref(),
+        )
+        .map_err(|error| EngineError::new(error.to_string()))
     }
 
     /// One denoising step returning the top-k candidates per position.
@@ -284,8 +321,16 @@ impl Engine {
         if self.kind != ModelKind::Dllm {
             return Err(EngineError::new("model is not qwen3-dllm"));
         }
-        dllm_denoise_topk(&self.gguf, &self.bytes, tokens, positions, block, top_k)
-            .map_err(|error| EngineError::new(error.to_string()))
+        dllm_denoise_topk(
+            &self.gguf,
+            &self.bytes,
+            tokens,
+            positions,
+            block,
+            top_k,
+            self.lora.as_ref(),
+        )
+        .map_err(|error| EngineError::new(error.to_string()))
     }
 
     /// NudeNet detections as flattened `[x1, y1, x2, y2, score, label]` rows.
@@ -412,6 +457,22 @@ impl Model {
         Engine::new(bytes)
             .map(|engine| Model { engine })
             .map_err(js_error)
+    }
+
+    /// Load a base dLLM and a LoRA adapter in one step.
+    #[wasm_bindgen(js_name = withLora)]
+    pub fn with_lora(base_bytes: Vec<u8>, lora_bytes: Vec<u8>) -> Result<Model, JsValue> {
+        Engine::with_lora(base_bytes, lora_bytes)
+            .map(|engine| Model { engine })
+            .map_err(js_error)
+    }
+
+    pub fn lora_rank(&self) -> Option<usize> {
+        self.engine.lora_rank()
+    }
+
+    pub fn lora_expert(&self) -> Option<String> {
+        self.engine.lora_expert()
     }
 
     pub fn architecture(&self) -> String {
