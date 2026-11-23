@@ -75,3 +75,18 @@ fn qwen3_splits_each_digit_like_the_reference_tokenizer() {
     let gpt2 = BpeTokenizer::from_spec(&spec("gpt2", &tokens, &merges)).expect("gpt2 BPE");
     assert_eq!(gpt2.encode("12", false).unwrap(), vec![2]);
 }
+
+#[test]
+fn qwen3_matches_control_tokens_before_bpe() {
+    let mut spec = spec("qwen3", &["a", "b", "<|mask|>"], &[]);
+    spec.token_types = vec![TokenType::Normal, TokenType::Normal, TokenType::Control];
+    let tokenizer = BpeTokenizer::from_spec(&spec).expect("qwen3 BPE");
+
+    assert_eq!(tokenizer.encode("<|mask|>", false).unwrap(), vec![2]);
+    assert_eq!(
+        tokenizer.encode("a<|mask|>b", false).unwrap(),
+        vec![0, 2, 1]
+    );
+    // A near miss is ordinary text, not a control token.
+    assert_ne!(tokenizer.encode("<|mas", false).unwrap(), vec![2]);
+}
