@@ -1,129 +1,88 @@
-# Theia dLLM denoise API (design)
+# Theia dLLM denoise API
 
 Theia runs small masked-diffusion language models (dLLMs) across Flaxia Crowd
 nodes and merges their per-position token distributions. This note records the
-proposed FriedFlaxia extension: what already fits, what is missing, and the API
-shape the Crowd workload layer can target.
+implemented FriedFlaxia extension and what is still missing.
 
-> Status: design only. No runtime change yet.
+> Status: the qwen3-dllm forward pass, block attention mask, full-logit and
+> top-k APIs, and the wasm bindings are implemented. LoRA adapters, a block/KV
+> cache and real-model parity are next.
 
-## What already fits
+## Implemented
 
-FriedFlaxia is a good substrate for a denoiser even though it cannot run one
-today:
+`crates/friedflaxia-core/src/models/dllm.rs`:
 
-- **Bidirectional attention exists.** `models/d1omni.rs` scores every query
-  against all keys (no causal mask), and `models/embeddinggemma.rs` uses
-  non-causal attention with an optional centered window.
-- **All-position hidden states exist.** `trunk_forward` (d1-omni) and
-  `forward_hidden_until` (PLaMo) return a vector per token; the PLaMo helper is
-  currently private.
-- **Per-position logits are a small step.** `decision_logits(marker_positions)`
-  already returns one score per requested position, and the host applies
-  softmax. Generalizing this from 3 decision classes to vocabulary-sized logits
-  is the natural path.
-- **GGUF is a generic container.** Quantized loading (`Q4_0`, `Q4_1`, `Q6_K`,
-  `Q8_0`) and the tensor index do not care about the architecture name.
-- **The wasm API already returns raw values for host-side post-processing**, so
-  Self-Repulsion and distribution merging can stay in the Crowd JS workload
-  layer while Rust focuses on the forward pass.
+- **`qwen3-dllm` architecture** with the Qwen3 layer layout: pre-attention
+  RMSNorm, GQA q/k/v, per-head q/k RMSNorm, NeoX RoPE at the absolute canvas
+  position, SwiGLU FFN, and a tied or explicit output projection.
+- **Block-diffusion attention mask.** Queries inside `[start, end)` attend to
+  the clean prefix `0..start` and bidirectionally to every token in the block.
+  Queries outside the block fall back to causal attention; their outputs are not
+  scored. This is the mask a masked-diffusion sampler needs.
+- **Full logits or sparse candidates.** `denoise_step` returns row-major
+  `[positions][vocab]` logits and the max-softmax confidence. `denoise_topk`
+  returns the top-k token ids/probabilities so a 4B vocabulary does not have to
+  cross the wasm boundary on every step.
+- **Validation.** Token ids, block bounds, positions, and `top_k` are checked
+  before any tensor is read.
 
-## What is missing
+The wasm `Model` exposes both entry points:
 
-1. **Architecture whitelist.** `ModelKind::from_architecture` accepts only
-   `gemma-embedding2`, `lfm2`, `plamo3`, `yolov8-nudenet`.
-2. **Generation is AR greedy only.** `generate()` is prefill → one-token decode
-   → `argmax`; there is no way to score a full masked canvas.
-3. **No attention-mask machinery.** Attention ranges are hard-coded causal or
-   full-range. Block diffusion needs a per-token mask (bidirectional inside the
-   active block, causal across the clean prefix).
-4. **RoPE takes a scalar sequential position.** dLLMs need per-token positions
-   and a stable canvas index.
-5. **KV cache is append-only and monotonic.** Iterative unmasking revises
-   earlier positions, so either the cache is rebuilt per step or a block cache
-   is introduced.
-6. **No sampling and no ensemble.** `argmax` is the only selector; there is no
-   multi-path pool or distribution merge.
-7. **Scalar f32 kernels.** The current loops are fine for small encoders but
-   will not carry a 2B dLLM across K paths × T steps at interactive latency.
+```ts
+model.denoise_step(tokens, positions, blockStart, blockEnd)
+// { logits: Float32Array, positions: Uint32Array,
+//   confidence: Float32Array, vocabSize: number }
 
-## Proposed API
-
-Keep the engine responsible for the forward pass and return **logits**, not
-sampled tokens. The host owns Self-Repulsion and merging.
-
-```rust
-pub struct DenoiseStepInput<'a> {
-    /// Canvas: prompt tokens followed by `mask_token_id` for unresolved slots.
-    pub tokens: &'a [u32],
-    /// Positions to score (the still-masked slots of the active block).
-    pub positions: &'a [u32],
-    /// Active block range `[start, end)`.
-    pub block: (usize, usize),
-}
-
-pub struct DenoiseStepOutput {
-    /// Row-major `positions.len() * vocab_size` logits.
-    pub logits: Vec<f32>,
-    pub vocab_size: usize,
-    /// Per-position max-softmax confidence, for the host's commit rule.
-    pub confidence: Vec<f32>,
-}
-
-impl Model {
-    /// One masked-diffusion denoising step over the active block.
-    pub fn denoise_step(
-        &self,
-        input: DenoiseStepInput<'_>,
-    ) -> Result<DenoiseStepOutput, ModelError>;
-}
+model.denoise_topk(tokens, positions, blockStart, blockEnd, topK)
+// { positions: Uint32Array, tokenIds: Uint32Array,
+//   probabilities: Float32Array, confidence: Float32Array,
+//   vocabSize: number, topK: number }
 ```
 
-A lower-level primitive makes the step easy to test and reuse:
+`logits` is row-major `[positions.len()][vocabSize]`; `tokenIds` and
+`probabilities` are row-major `[positions.len()][topK]`.
 
-```rust
-impl Model {
-    /// Hidden state for every token in `tokens`, with block-aware attention.
-    pub fn forward_positions(&self, tokens: &[u32], block: (usize, usize))
-        -> Result<Vec<Vec<f32>>, ModelError>;
+## Still missing
 
-    /// Vocabulary logits for the requested positions.
-    pub fn position_logits(&self, tokens: &[u32], positions: &[u32], block: (usize, usize))
-        -> Result<DenoiseStepOutput, ModelError>;
-}
+1. **Block/KV cache.** The current step recomputes the whole sequence (with the
+   block mask) and only scores the requested positions. A prefix cache and a
+   block cache are the next large performance win.
+2. **LoRA adapters.** Theia's v1 experts are LoRA adapters on one base model;
+   the engine does not apply adapters yet.
+3. **SDAR self-conditioning.** QwenDLM's residual adapter is not implemented;
+   the base Qwen3 forward is.
+4. **Real-model parity.** The synthetic tiny GGUF covers the mask and API; a
+   pinned QwenDLM/Qwen3-0.6B-bd3lm comparison is still required.
+5. **Sampling and ensemble.** The host owns sampling, Self-Repulsion and delta
+   merging. Rust only returns scores.
+
+## Tests
+
+`crates/friedflaxia-core/tests/dllm.rs` builds a tiny Qwen3-style GGUF and
+covers:
+
+- logits/confidence shape and determinism,
+- the block mask (future tokens do not affect the block; the clean prefix does),
+- tied output embeddings,
+- top-k vs the full distribution,
+- invalid token ids, blocks and positions.
+
+A real-model smoke test is available behind
+`FRIEDFLAXIA_DLLM_GGUF=/path/to/model.gguf`:
+
+```sh
+cargo test --release --test dllm -- --ignored --nocapture
 ```
-
-`softmax` stays out of Rust: Crowd's decision path already does it in JS, and
-the merge needs the raw logits anyway.
-
-## Implementation sketch
-
-1. Add `models/qwen3_dlm.rs` (or the chosen dLLM backbone) with:
-   - block-bidirectional attention mask,
-   - per-token RoPE positions,
-   - mask-token embedding lookup,
-   - a block cache so the clean prefix is not recomputed every step.
-2. Add `ModelKind` and the architecture string. Because we own the engine, the
-   GGUF metadata can use a project-specific architecture name; llama.cpp
-   compatibility is not required.
-3. Expose `denoise_step` through `friedflaxia-wasm` and re-vendor the artifact
-   into Crowd (`packages/node/src/vendor/friedflaxia`).
-4. Pin the converted GGUF in Crowd's model registry with a SHA-256, as the
-   existing models do.
 
 ## Performance
 
 A denoise step is a full forward over the active block; a response costs
-`K paths × T steps` of them. Even at block size 32 this is far more compute than
-AR decoding. Before committing to a 2B model:
+`K paths × T steps` of them. Before committing to a 4B model:
 
-1. Measure one `denoise_step` on the target hardware.
-2. If scalar f32 is too slow, add wasm SIMD for the browser and native threads
-   for the desktop node.
-3. If that is still short, a `wgpu` backend is the larger but durable option.
-
-Start on the native node: it is easier to profile and does not need the wasm
-rebuild loop. Port to wasm once the step shape and merge behaviour are settled.
+1. Measure one step on the target hardware (native first).
+2. Add the block/KV cache so the clean prefix is not recomputed.
+3. Use the existing batched quantized matmul, then wasm SIMD / native threads,
+   and finally `wgpu` if the step is still short.
 
 ## Model candidates
 

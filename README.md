@@ -86,6 +86,8 @@ Additionally:
 - PLaMO KV cache (`PlamoSession`) with prefill + single-token decode
 - Batched Q4_0/Q8_0 matmul kernels (`quant::matmul_*`) and batched encoder /
   prefill passes
+- `qwen3-dllm` masked-diffusion denoise step (block attention mask, full logits
+  or top-k candidates, wasm bindings)
 - wasm-bindgen package (`friedflaxia-wasm`) with `Model`, `MultimodalModel`
   and `D1MultimodalModel`
 - Node smoke test against the real Q8_0 model
@@ -112,12 +114,13 @@ Next slices:
 3. NudeNet 640m
 4. Further SIMD kernels and wasm size/load tuning
 
-## Theia dLLM denoise (design)
+## Theia dLLM denoise
 
 Theia runs small masked-diffusion LMs across Crowd nodes and merges their
-per-position token distributions. The proposed `denoise_step` API, the reusable
-bidirectional/all-position substrate, and the concrete blockers are documented
-in [docs/dllm-denoise.md](docs/dllm-denoise.md).
+per-position token distributions. The implemented `denoise_step` / `denoise_topk`
+API, the block attention mask, and the remaining work (LoRA adapters, block/KV
+cache, real-model parity) are documented in
+[docs/dllm-denoise.md](docs/dllm-denoise.md).
 
 ## wasm
 
