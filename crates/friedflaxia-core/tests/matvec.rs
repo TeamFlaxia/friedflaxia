@@ -93,7 +93,6 @@ fn q8_0_matmul_matches_per_token_matvec() {
 
     let rows = 3usize;
     let cols = 64usize;
-    let n_tokens = 5usize;
     let mut weights = Vec::new();
     for row in 0..rows {
         for block in 0..cols / 32 {
@@ -103,25 +102,27 @@ fn q8_0_matmul_matches_per_token_matvec() {
             }
         }
     }
-    let inputs: Vec<f32> = (0..n_tokens * cols).map(|i| pseudo(i as u64)).collect();
-
-    let mut batched = vec![0.0f32; n_tokens * rows];
-    matmul_q8_0(&weights, rows, cols, &inputs, n_tokens, &mut batched).expect("batched");
-    for token in 0..n_tokens {
-        let expected = matvec_q8_0(
-            &weights,
-            rows,
-            cols,
-            &inputs[token * cols..(token + 1) * cols],
-        )
-        .unwrap();
-        for row in 0..rows {
-            let actual = batched[token * rows + row];
-            assert!(
-                (actual - expected[row]).abs() < 1e-4,
-                "token {token} row {row}: {actual} != {}",
-                expected[row]
-            );
+    // 5 stays inside one tile; 17 and 33 cross the 16-token tile boundary.
+    for n_tokens in [5usize, 17, 33] {
+        let inputs: Vec<f32> = (0..n_tokens * cols).map(|i| pseudo(i as u64)).collect();
+        let mut batched = vec![0.0f32; n_tokens * rows];
+        matmul_q8_0(&weights, rows, cols, &inputs, n_tokens, &mut batched).expect("batched");
+        for token in 0..n_tokens {
+            let expected = matvec_q8_0(
+                &weights,
+                rows,
+                cols,
+                &inputs[token * cols..(token + 1) * cols],
+            )
+            .unwrap();
+            for row in 0..rows {
+                let actual = batched[token * rows + row];
+                assert_eq!(
+                    actual.to_bits(),
+                    expected[row].to_bits(),
+                    "tokens={n_tokens} token={token} row={row}"
+                );
+            }
         }
     }
 }
@@ -132,7 +133,6 @@ fn q4_0_matmul_matches_per_token_matvec() {
 
     let rows = 2usize;
     let cols = 64usize;
-    let n_tokens = 4usize;
     let mut weights = Vec::new();
     for row in 0..rows {
         for block in 0..cols / 32 {
@@ -142,29 +142,56 @@ fn q4_0_matmul_matches_per_token_matvec() {
             }
         }
     }
-    let inputs: Vec<f32> = (0..n_tokens * cols)
-        .map(|i| pseudo(i as u64 + 17))
-        .collect();
-
-    let mut batched = vec![0.0f32; n_tokens * rows];
-    matmul_q4_0(&weights, rows, cols, &inputs, n_tokens, &mut batched).expect("batched");
-    for token in 0..n_tokens {
-        let expected = matvec_q4_0(
-            &weights,
-            rows,
-            cols,
-            &inputs[token * cols..(token + 1) * cols],
-        )
-        .unwrap();
-        for row in 0..rows {
-            let actual = batched[token * rows + row];
-            assert!(
-                (actual - expected[row]).abs() < 1e-4,
-                "token {token} row {row}: {actual} != {}",
-                expected[row]
-            );
+    for n_tokens in [4usize, 17, 33] {
+        let inputs: Vec<f32> = (0..n_tokens * cols)
+            .map(|i| pseudo(i as u64 + 17))
+            .collect();
+        let mut batched = vec![0.0f32; n_tokens * rows];
+        matmul_q4_0(&weights, rows, cols, &inputs, n_tokens, &mut batched).expect("batched");
+        for token in 0..n_tokens {
+            let expected = matvec_q4_0(
+                &weights,
+                rows,
+                cols,
+                &inputs[token * cols..(token + 1) * cols],
+            )
+            .unwrap();
+            for row in 0..rows {
+                let actual = batched[token * rows + row];
+                assert_eq!(
+                    actual.to_bits(),
+                    expected[row].to_bits(),
+                    "tokens={n_tokens} token={token} row={row}"
+                );
+            }
         }
     }
+}
+
+#[test]
+fn tensor_matmul_falls_back_for_f32() {
+    use friedflaxia_core::gguf::{TensorInfo, TensorType};
+    use friedflaxia_core::tensor::TensorView;
+
+    let bytes: Vec<u8> = [1.0f32, 2.0, 3.0, 4.0]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect();
+    let info = TensorInfo {
+        name: "x".into(),
+        dims: vec![2, 2],
+        tensor_type: TensorType::F32,
+        offset: 0,
+    };
+    let view = TensorView {
+        info: &info,
+        bytes: &bytes,
+    };
+    let out = view.matmul(&[1.0, 1.0, 2.0, 3.0], 2).expect("f32 matmul");
+    // rows=2, cols=2:
+    // token 0: row0 [1,2]·[1,1]=3, row1 [3,4]·[1,1]=7
+    // token 1: row0 [1,2]·[2,3]=8, row1 [3,4]·[2,3]=18
+    assert_eq!(out, vec![3.0, 7.0, 8.0, 18.0]);
 }
 
 #[test]
@@ -175,4 +202,10 @@ fn matmul_rejects_bad_shapes() {
     assert!(matmul_q8_0(&[0u8; 33], 1, 32, &[0.0; 64], 2, &mut out).is_err());
     assert!(matmul_q8_0(&[0u8; 34], 1, 32, &[0.0; 64], 2, &mut [0.0; 1]).is_err());
     assert!(matmul_q8_0(&[0u8; 34], 1, 32, &[0.0; 32], 0, &mut []).is_err());
+    // cols must be a whole number of blocks.
+    assert!(matmul_q8_0(&[0u8; 68], 1, 48, &[0.0; 48], 1, &mut [0.0; 1]).is_err());
+    assert!(
+        friedflaxia_core::quant::matmul_q4_0(&[0u8; 36], 1, 40, &[0.0; 40], 1, &mut [0.0; 1])
+            .is_err()
+    );
 }

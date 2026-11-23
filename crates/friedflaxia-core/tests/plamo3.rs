@@ -55,6 +55,23 @@ fn plamo_last_token_logits_match_llama_cpp() {
     cached_top.sort_by(|a, b| cached[*b].partial_cmp(&cached[*a]).unwrap());
     assert_eq!(&cached_top[..10], &GOLDEN_TOP10, "cached prefill top-10");
 
+    // Prefill-after-prefill exercises the populated KV cache and the absolute
+    // RoPE positions of the second chunk.
+    for split in [7usize, 17] {
+        let mut chunked = PlamoSession::new(&gguf, &file).expect("chunked session");
+        chunked.prefill(&PROMPT_IDS[..split]).expect("first chunk");
+        let chunked_logits = chunked.prefill(&PROMPT_IDS[split..]).expect("second chunk");
+        let max_chunk = chunked_logits
+            .iter()
+            .zip(&cached)
+            .map(|(chunked, full)| (chunked - full).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_chunk < 1e-3,
+            "split {split} prefill differs from one-shot prefill by {max_chunk}"
+        );
+    }
+
     let next = GOLDEN_TOP10[0] as u32;
     let cached_next = session.decode(next).expect("cached decode");
     let mut with_next = PROMPT_IDS.to_vec();
