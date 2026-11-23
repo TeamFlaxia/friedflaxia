@@ -18,13 +18,17 @@ implemented FriedFlaxia extension and what is still missing.
 - **Block-diffusion attention mask.** Queries inside `[start, end)` attend to
   the clean prefix `0..start` and bidirectionally to every token in the block.
   Queries outside the block fall back to causal attention; their outputs are not
-  scored. This is the mask a masked-diffusion sampler needs.
-- **Full logits or sparse candidates.** `denoise_step` returns row-major
+  scored. Tokens at or after `end` are never read, so the backbone only runs over
+  `tokens[..end]`.
+- **Full logits or sparse candidates.** `denoise_step` returns raw row-major
   `[positions][vocab]` logits and the max-softmax confidence. `denoise_topk`
-  returns the top-k token ids/probabilities so a 4B vocabulary does not have to
-  cross the wasm boundary on every step.
-- **Validation.** Token ids, block bounds, positions, and `top_k` are checked
-  before any tensor is read.
+  returns the top-k token ids with **softmaxed** probabilities (one full-vocab
+  pass per position, no duplicate exponentiation) and the effective `topK` after
+  clamping to the vocabulary.
+- **Validation.** Token ids, block bounds, unique positions, and `top_k` are
+  checked before any tensor is read. Positions may be anywhere before `end`
+  (including the clean prefix), because the tail is the only part that is not
+  computed.
 
 The wasm `Model` exposes both entry points:
 
@@ -39,33 +43,41 @@ model.denoise_topk(tokens, positions, blockStart, blockEnd, topK)
 //   vocabSize: number, topK: number }
 ```
 
-`logits` is row-major `[positions.len()][vocabSize]`; `tokenIds` and
-`probabilities` are row-major `[positions.len()][topK]`.
+`logits` is row-major `[positions.len()][vocabSize]` and is **raw** (apply
+softmax on the host if you need probabilities). `tokenIds` and `probabilities`
+are row-major `[positions.len()][topK]`; `probabilities` are already softmaxed,
+so `confidence` equals the first probability of each row.
 
 ## Still missing
 
-1. **Block/KV cache.** The current step recomputes the whole sequence (with the
-   block mask) and only scores the requested positions. A prefix cache and a
-   block cache are the next large performance win.
-2. **LoRA adapters.** Theia's v1 experts are LoRA adapters on one base model;
+1. **Block/KV cache.** The step already truncates the backbone at `end` and
+   only scores the requested positions, but the clean prefix is still recomputed
+   every round. A prefix cache and a block cache are the next large performance
+   win.
+2. **A session handle.** Config, tensor lookups and norm tensors are re-read on
+   every call. A `DllmSession` is also the natural home for the KV cache.
+3. **LoRA adapters.** Theia's v1 experts are LoRA adapters on one base model;
    the engine does not apply adapters yet.
-3. **SDAR self-conditioning.** QwenDLM's residual adapter is not implemented;
+4. **SDAR self-conditioning.** QwenDLM's residual adapter is not implemented;
    the base Qwen3 forward is.
-4. **Real-model parity.** The synthetic tiny GGUF covers the mask and API; a
+5. **Real-model parity.** The synthetic tiny GGUFs cover the mask and API; a
    pinned QwenDLM/Qwen3-0.6B-bd3lm comparison is still required.
-5. **Sampling and ensemble.** The host owns sampling, Self-Repulsion and delta
+6. **Sampling and ensemble.** The host owns sampling, Self-Repulsion and delta
    merging. Rust only returns scores.
 
 ## Tests
 
-`crates/friedflaxia-core/tests/dllm.rs` builds a tiny Qwen3-style GGUF and
+`crates/friedflaxia-core/tests/dllm.rs` builds tiny Qwen3-style GGUFs and
 covers:
 
 - logits/confidence shape and determinism,
-- the block mask (future tokens do not affect the block; the clean prefix does),
+- the block mask (future tokens are not read, the clean prefix is read, and the
+  block is bidirectional),
 - tied output embeddings,
-- top-k vs the full distribution,
-- invalid token ids, blocks and positions.
+- top-k vs the full distribution and effective `top_k` clamping,
+- a hardened two-layer / 4-query-head / 2-KV-head fixture with non-uniform norms
+  and golden logits,
+- invalid token ids, blocks, duplicate positions and an out-of-block tail.
 
 A real-model smoke test is available behind
 `FRIEDFLAXIA_DLLM_GGUF=/path/to/model.gguf`:
@@ -93,6 +105,10 @@ License safety comes first (avoid PolyForm Noncommercial):
 | `yifanyu/QwenDLM-4B` | 4B | Apache-2.0 | primary |
 | `nvidia/Nemotron-Labs-Diffusion-3B` | 3B | NVIDIA Open Model License | 3B alternative |
 | `dllm-hub/Qwen3-0.6B-diffusion-bd3lm-v0.1` | 0.8B | Apache-2.0 | algorithm validation |
+
+**Quantization:** the kernels cover F32, BF16, Q4_0, Q4_1, Q8_0 and Q6_K. A
+typical `Q4_K_M` conversion is not supported yet, so pin the converted dLLM GGUF
+to Q8_0 or Q4_0 (or add a Q4_K kernel before shipping it).
 
 ## Related
 
