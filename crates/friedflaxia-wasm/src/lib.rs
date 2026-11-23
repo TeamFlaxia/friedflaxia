@@ -8,9 +8,14 @@ use friedflaxia_core::gguf::{Gguf, ParseOptions};
 use friedflaxia_core::models::d1_audio::encode_audio as encode_d1_audio;
 use friedflaxia_core::models::d1_vision::encode_image as encode_d1_image;
 use friedflaxia_core::models::d1omni::{decision_logits, decision_logits_with_prefix};
+use friedflaxia_core::models::dllm::{
+    DenoiseStepOutput, DenoiseTopKOutput, DllmConfig, denoise_step_with_lora as dllm_denoise_step,
+    denoise_topk_with_lora as dllm_denoise_topk,
+};
 use friedflaxia_core::models::embeddinggemma::{embed_text, embed_text_with_features};
 use friedflaxia_core::models::gemma_audio::encode_audio;
 use friedflaxia_core::models::gemma_vision::encode_image;
+use friedflaxia_core::models::lora::LoraModel;
 use friedflaxia_core::models::nudenet::NudeNet;
 use friedflaxia_core::models::plamo3::{PlamoSession, next_token};
 use friedflaxia_core::tokenizer::{BpeTokenizer, UnigramTokenizer};
@@ -102,6 +107,7 @@ enum ModelKind {
     D1Omni,
     Plamo3,
     NudeNet,
+    Dllm,
 }
 
 impl ModelKind {
@@ -111,6 +117,7 @@ impl ModelKind {
             "lfm2" => Some(Self::D1Omni),
             "plamo3" => Some(Self::Plamo3),
             "yolov8-nudenet" => Some(Self::NudeNet),
+            "qwen3-dllm" => Some(Self::Dllm),
             _ => None,
         }
     }
@@ -123,6 +130,7 @@ pub struct Engine {
     kind: ModelKind,
     tokenizer: Option<Tokenizer>,
     nudenet: Option<NudeNet>,
+    lora: Option<LoraModel>,
 }
 
 impl Engine {
@@ -161,7 +169,35 @@ impl Engine {
             kind,
             tokenizer,
             nudenet,
+            lora: None,
         })
+    }
+
+    /// Load a base dLLM plus a LoRA adapter.
+    pub fn with_lora(bytes: Vec<u8>, lora_bytes: Vec<u8>) -> Result<Self, EngineError> {
+        let mut engine = Self::new(bytes)?;
+        if engine.kind != ModelKind::Dllm {
+            return Err(EngineError::new("LoRA adapters require a qwen3-dllm model"));
+        }
+        let config = DllmConfig::from_gguf(&engine.gguf)
+            .map_err(|error| EngineError::new(error.to_string()))?;
+        let lora_gguf = Gguf::parse_with_options(&lora_bytes, ParseOptions::default())
+            .map_err(|error| EngineError::new(error.to_string()))?;
+        let lora = LoraModel::from_gguf(lora_gguf, lora_bytes, &config)
+            .map_err(|error| EngineError::new(error.to_string()))?;
+        engine.lora = Some(lora);
+        Ok(engine)
+    }
+
+    pub fn lora_rank(&self) -> Option<usize> {
+        self.lora.as_ref().map(LoraModel::rank)
+    }
+
+    pub fn lora_expert(&self) -> Option<String> {
+        self.lora
+            .as_ref()
+            .and_then(LoraModel::expert)
+            .map(str::to_owned)
     }
 
     pub fn architecture(&self) -> &str {
@@ -251,6 +287,50 @@ impl Engine {
         }
         next_token(&self.gguf, &self.bytes, token_ids)
             .map_err(|error| EngineError::new(error.to_string()))
+    }
+
+    /// One masked-diffusion denoising step returning full per-position logits.
+    pub fn denoise_step(
+        &self,
+        tokens: &[u32],
+        positions: &[usize],
+        block: (usize, usize),
+    ) -> Result<DenoiseStepOutput, EngineError> {
+        if self.kind != ModelKind::Dllm {
+            return Err(EngineError::new("model is not qwen3-dllm"));
+        }
+        dllm_denoise_step(
+            &self.gguf,
+            &self.bytes,
+            tokens,
+            positions,
+            block,
+            self.lora.as_ref(),
+        )
+        .map_err(|error| EngineError::new(error.to_string()))
+    }
+
+    /// One denoising step returning the top-k candidates per position.
+    pub fn denoise_topk(
+        &self,
+        tokens: &[u32],
+        positions: &[usize],
+        block: (usize, usize),
+        top_k: usize,
+    ) -> Result<DenoiseTopKOutput, EngineError> {
+        if self.kind != ModelKind::Dllm {
+            return Err(EngineError::new("model is not qwen3-dllm"));
+        }
+        dllm_denoise_topk(
+            &self.gguf,
+            &self.bytes,
+            tokens,
+            positions,
+            block,
+            top_k,
+            self.lora.as_ref(),
+        )
+        .map_err(|error| EngineError::new(error.to_string()))
     }
 
     /// NudeNet detections as flattened `[x1, y1, x2, y2, score, label]` rows.
@@ -379,6 +459,25 @@ impl Model {
             .map_err(js_error)
     }
 
+    /// Load a base dLLM and a LoRA adapter in one step.
+    #[wasm_bindgen(js_name = withLora)]
+    #[allow(non_snake_case)]
+    pub fn with_lora(baseBytes: Vec<u8>, loraBytes: Vec<u8>) -> Result<Model, JsValue> {
+        Engine::with_lora(baseBytes, loraBytes)
+            .map(|engine| Model { engine })
+            .map_err(js_error)
+    }
+
+    #[wasm_bindgen(js_name = loraRank)]
+    pub fn lora_rank(&self) -> Option<usize> {
+        self.engine.lora_rank()
+    }
+
+    #[wasm_bindgen(js_name = loraExpert)]
+    pub fn lora_expert(&self) -> Option<String> {
+        self.engine.lora_expert()
+    }
+
     pub fn architecture(&self) -> String {
         self.engine.architecture().to_owned()
     }
@@ -426,6 +525,117 @@ impl Model {
 
     pub fn next_token(&self, token_ids: &[u32]) -> Result<u32, JsValue> {
         self.engine.next_token(token_ids).map_err(js_error)
+    }
+
+    /// Full-vocabulary logits for the requested positions of one denoise step.
+    ///
+    /// Returns `{ logits: Float32Array, positions: Uint32Array, confidence:
+    /// Float32Array, vocabSize: number }`. `logits` is row-major
+    /// `[positions.len()][vocabSize]`.
+    pub fn denoise_step(
+        &self,
+        tokens: &[u32],
+        positions: &[u32],
+        block_start: u32,
+        block_end: u32,
+    ) -> Result<JsValue, JsValue> {
+        let positions_usize: Vec<usize> = positions.iter().map(|value| *value as usize).collect();
+        let out = self
+            .engine
+            .denoise_step(
+                tokens,
+                &positions_usize,
+                (block_start as usize, block_end as usize),
+            )
+            .map_err(js_error)?;
+        let object = js_sys::Object::new();
+        let logits = js_sys::Float32Array::from(out.logits.as_slice());
+        let confidence = js_sys::Float32Array::from(out.confidence.as_slice());
+        let positions = js_sys::Uint32Array::from(positions);
+        js_sys::Reflect::set(
+            &object,
+            &JsValue::from_str("logits"),
+            &JsValue::from(logits),
+        )?;
+        js_sys::Reflect::set(
+            &object,
+            &JsValue::from_str("confidence"),
+            &JsValue::from(confidence),
+        )?;
+        js_sys::Reflect::set(
+            &object,
+            &JsValue::from_str("positions"),
+            &JsValue::from(positions),
+        )?;
+        js_sys::Reflect::set(
+            &object,
+            &JsValue::from_str("vocabSize"),
+            &JsValue::from_f64(out.vocab_size as f64),
+        )?;
+        Ok(object.into())
+    }
+
+    /// Top-k candidates for the requested positions of one denoise step.
+    ///
+    /// Returns `{ positions, tokenIds, probabilities, confidence, vocabSize,
+    /// topK }`. `tokenIds`/`probabilities` are row-major
+    /// `[positions.len()][topK]`.
+    pub fn denoise_topk(
+        &self,
+        tokens: &[u32],
+        positions: &[u32],
+        block_start: u32,
+        block_end: u32,
+        top_k: u32,
+    ) -> Result<JsValue, JsValue> {
+        let positions_usize: Vec<usize> = positions.iter().map(|value| *value as usize).collect();
+        let out = self
+            .engine
+            .denoise_topk(
+                tokens,
+                &positions_usize,
+                (block_start as usize, block_end as usize),
+                top_k as usize,
+            )
+            .map_err(js_error)?;
+        let k = out.top_k;
+        let positions: Vec<u32> = out.positions.iter().map(|value| *value as u32).collect();
+        let object = js_sys::Object::new();
+        let position_array = js_sys::Uint32Array::from(positions.as_slice());
+        let token_array = js_sys::Uint32Array::from(out.token_ids.as_slice());
+        let probabilities = js_sys::Float32Array::from(out.probabilities.as_slice());
+        let confidence = js_sys::Float32Array::from(out.confidence.as_slice());
+        js_sys::Reflect::set(
+            &object,
+            &JsValue::from_str("positions"),
+            &JsValue::from(position_array),
+        )?;
+        js_sys::Reflect::set(
+            &object,
+            &JsValue::from_str("tokenIds"),
+            &JsValue::from(token_array),
+        )?;
+        js_sys::Reflect::set(
+            &object,
+            &JsValue::from_str("probabilities"),
+            &JsValue::from(probabilities),
+        )?;
+        js_sys::Reflect::set(
+            &object,
+            &JsValue::from_str("confidence"),
+            &JsValue::from(confidence),
+        )?;
+        js_sys::Reflect::set(
+            &object,
+            &JsValue::from_str("vocabSize"),
+            &JsValue::from_f64(out.vocab_size as f64),
+        )?;
+        js_sys::Reflect::set(
+            &object,
+            &JsValue::from_str("topK"),
+            &JsValue::from_f64(k as f64),
+        )?;
+        Ok(object.into())
     }
 
     pub fn token_id(&self, token: &str) -> Option<u32> {
