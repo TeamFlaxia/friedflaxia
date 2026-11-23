@@ -7,6 +7,7 @@ pub mod dllm;
 pub mod embeddinggemma;
 pub mod gemma_audio;
 pub mod gemma_vision;
+pub mod lora;
 pub mod nudenet;
 pub mod plamo3;
 

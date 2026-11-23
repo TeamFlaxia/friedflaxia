@@ -15,6 +15,7 @@
 //! confidence the host uses for its commit rule.
 
 use super::ModelError;
+use super::lora::{LoraModel, LoraModule};
 use crate::gguf::{Gguf, ModelConfig};
 use crate::ops::{rms_norm, rms_norm_batch, rope_neox_inplace, silu};
 use crate::tensor::{TensorView, tensor};
@@ -193,12 +194,13 @@ fn run_backbone(
     tokens: &[u32],
     positions: &[usize],
     block: (usize, usize),
+    lora: Option<&LoraModel>,
 ) -> Result<(DllmConfig, Vec<f32>), ModelError> {
     let config = DllmConfig::from_gguf(gguf)?;
     validate_input(&config, tokens, positions, block)?;
     // Tokens at or after block.1 cannot influence a query before block.1 under
     // the block mask, so the backbone only needs the prefix plus the block.
-    let hidden = forward_hidden(gguf, file, &config, &tokens[..block.1], block)?;
+    let hidden = forward_hidden(gguf, file, &config, &tokens[..block.1], block, lora)?;
     Ok((config, hidden))
 }
 
@@ -210,7 +212,19 @@ pub fn denoise_step(
     positions: &[usize],
     block: (usize, usize),
 ) -> Result<DenoiseStepOutput, ModelError> {
-    let (config, hidden) = run_backbone(gguf, file, tokens, positions, block)?;
+    denoise_step_with_lora(gguf, file, tokens, positions, block, None)
+}
+
+/// Like [`denoise_step`], with an optional LoRA adapter applied to projections.
+pub fn denoise_step_with_lora(
+    gguf: &Gguf,
+    file: &[u8],
+    tokens: &[u32],
+    positions: &[usize],
+    block: (usize, usize),
+    lora: Option<&LoraModel>,
+) -> Result<DenoiseStepOutput, ModelError> {
+    let (config, hidden) = run_backbone(gguf, file, tokens, positions, block, lora)?;
     let logits = projected_logits(gguf, file, &config, &hidden, positions)?;
     let confidence = logits
         .chunks_exact(config.vocab_size)
@@ -241,10 +255,24 @@ pub fn denoise_topk(
     block: (usize, usize),
     top_k: usize,
 ) -> Result<DenoiseTopKOutput, ModelError> {
+    denoise_topk_with_lora(gguf, file, tokens, positions, block, top_k, None)
+}
+
+/// Like [`denoise_topk`], with an optional LoRA adapter applied to projections.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_topk_with_lora(
+    gguf: &Gguf,
+    file: &[u8],
+    tokens: &[u32],
+    positions: &[usize],
+    block: (usize, usize),
+    top_k: usize,
+    lora: Option<&LoraModel>,
+) -> Result<DenoiseTopKOutput, ModelError> {
     if top_k == 0 {
         return Err(ModelError::Invalid("top_k must be at least 1"));
     }
-    let (config, hidden) = run_backbone(gguf, file, tokens, positions, block)?;
+    let (config, hidden) = run_backbone(gguf, file, tokens, positions, block, lora)?;
     // Keep all requested positions in one output projection. The output matrix
     // is the largest tensor in a 4B model, so chunking by position would stream
     // it p/chunk times; p is bounded by the caller's block size. If the peak
@@ -336,6 +364,7 @@ fn forward_hidden(
     config: &DllmConfig,
     tokens: &[u32],
     block: (usize, usize),
+    lora: Option<&LoraModel>,
 ) -> Result<Vec<f32>, ModelError> {
     let width = config.n_embd;
     let n = tokens.len();
@@ -396,7 +425,12 @@ fn forward_hidden(
         let normed = rms_norm_batch(&hidden, n, width, Some(&attn_norm), config.eps);
         let mut q = wq.matmul(&normed, n)?;
         let mut k = wk.matmul(&normed, n)?;
-        let v = wv.matmul(&normed, n)?;
+        let mut v = wv.matmul(&normed, n)?;
+        if let Some(lora) = lora {
+            lora.apply(layer, LoraModule::AttnQ, &normed, n, &mut q)?;
+            lora.apply(layer, LoraModule::AttnK, &normed, n, &mut k)?;
+            lora.apply(layer, LoraModule::AttnV, &normed, n, &mut v)?;
+        }
         if q.len() != n * q_dim || k.len() != n * kv_dim || v.len() != n * kv_dim {
             return Err(ModelError::Shape(format!("{prefix} projection length")));
         }
@@ -472,7 +506,10 @@ fn forward_hidden(
             }
         }
 
-        let projected = wo.matmul(&concat, n)?;
+        let mut projected = wo.matmul(&concat, n)?;
+        if let Some(lora) = lora {
+            lora.apply(layer, LoraModule::AttnOutput, &concat, n, &mut projected)?;
+        }
         if projected.len() != hidden.len() {
             return Err(ModelError::Shape(format!("{prefix} attention output")));
         }
@@ -481,12 +518,19 @@ fn forward_hidden(
         }
 
         let ffn_in = rms_norm_batch(&hidden, n, width, Some(&ffn_norm), config.eps);
-        let gate = ffn_gate.matmul(&ffn_in, n)?;
-        let up = ffn_up.matmul(&ffn_in, n)?;
+        let mut gate = ffn_gate.matmul(&ffn_in, n)?;
+        let mut up = ffn_up.matmul(&ffn_in, n)?;
+        if let Some(lora) = lora {
+            lora.apply(layer, LoraModule::FfnGate, &ffn_in, n, &mut gate)?;
+            lora.apply(layer, LoraModule::FfnUp, &ffn_in, n, &mut up)?;
+        }
         for (index, (gate, up)) in gate.iter().zip(&up).enumerate() {
             activated[index] = silu(*gate) * up;
         }
-        let down = ffn_down.matmul(&activated, n)?;
+        let mut down = ffn_down.matmul(&activated, n)?;
+        if let Some(lora) = lora {
+            lora.apply(layer, LoraModule::FfnDown, &activated, n, &mut down)?;
+        }
         if down.len() != hidden.len() {
             return Err(ModelError::Shape(format!("{prefix} ffn output")));
         }
