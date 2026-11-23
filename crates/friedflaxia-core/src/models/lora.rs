@@ -15,10 +15,13 @@
 //! `[cols, rows]` layout of the rest of the engine. A projection becomes
 //! `W x + (alpha / rank) * B (A x)`.
 
+// `dllm` imports this module to apply adapters; this module imports
+// `DllmConfig` for shape validation. The cycle is type-only; keep it that way.
 use super::ModelError;
 use super::dllm::DllmConfig;
 use crate::gguf::{Gguf, ModelConfig, TensorInfo};
 use crate::tensor::TensorView;
+use std::collections::HashMap;
 
 pub const LORA_ARCHITECTURE: &str = "qwen3-dllm-lora";
 
@@ -143,21 +146,46 @@ impl LoraModel {
             return Err(ModelError::Invalid("base model has no layers"));
         }
 
-        // Reject unknown modules and extra layers instead of silently ignoring
-        // them: a typo in an export would otherwise turn an expert into the base.
+        // Collect exactly the tensors we will apply. Any tensor containing
+        // `lora_` must match the canonical `blk.{i}.{module}.{side}.weight`
+        // name, so a typo cannot silently skip an expert.
+        let mut found: HashMap<(usize, usize, usize), String> = HashMap::new();
         for info in gguf.tensors() {
-            let Some((layer, module, _side)) = parse_lora_name(&info.name) else {
+            if !info.name.contains("lora_") {
                 continue;
-            };
-            if LoraModule::from_suffix(module).is_none() {
-                return Err(ModelError::Shape(format!(
-                    "lora adapter has an unsupported module: {module}"
-                )));
             }
+            let Some((layer, module_suffix, side)) = parse_lora_name(&info.name) else {
+                return Err(ModelError::Shape(format!(
+                    "malformed lora tensor name: {}",
+                    info.name
+                )));
+            };
+            let module = LoraModule::from_suffix(module_suffix).ok_or_else(|| {
+                ModelError::Shape(format!(
+                    "lora adapter has an unsupported module: {module_suffix}"
+                ))
+            })?;
             if layer >= base.n_layer {
                 return Err(ModelError::Shape(format!(
                     "lora adapter has layer {layer} but the base has {}",
                     base.n_layer
+                )));
+            }
+            let canonical = format!("blk.{layer}.{}.{side}.weight", module.suffix());
+            if info.name != canonical {
+                return Err(ModelError::Shape(format!(
+                    "non-canonical lora tensor name: {} (expected {canonical})",
+                    info.name
+                )));
+            }
+            let side_index = if side == "lora_a" { 0 } else { 1 };
+            if found
+                .insert((layer, module.index(), side_index), info.name.clone())
+                .is_some()
+            {
+                return Err(ModelError::Shape(format!(
+                    "duplicate lora tensor: {}",
+                    info.name
                 )));
             }
         }
@@ -168,16 +196,13 @@ impl LoraModel {
         for layer in 0..base.n_layer {
             let mut pairs: [Option<Pair>; 7] = std::array::from_fn(|_| None);
             for module in LoraModule::ALL {
-                let a_name = format!("blk.{layer}.{}.lora_a.weight", module.suffix());
-                let b_name = format!("blk.{layer}.{}.lora_b.weight", module.suffix());
-                match (
-                    gguf.tensor(&a_name).is_some(),
-                    gguf.tensor(&b_name).is_some(),
-                ) {
-                    (false, false) => {}
-                    (true, true) => {
-                        let a = resolve(&gguf, &bytes, data_offset, &a_name)?;
-                        let b = resolve(&gguf, &bytes, data_offset, &b_name)?;
+                let a_name = found.get(&(layer, module.index(), 0));
+                let b_name = found.get(&(layer, module.index(), 1));
+                match (a_name, b_name) {
+                    (None, None) => {}
+                    (Some(a_name), Some(b_name)) => {
+                        let a = resolve(&gguf, &bytes, data_offset, a_name)?;
+                        let b = resolve(&gguf, &bytes, data_offset, b_name)?;
                         check_pair(&a, &b, module, rank, base)?;
                         pairs[module.index()] = Some(Pair { a, b });
                         pair_count += 1;
@@ -283,10 +308,15 @@ fn resolve(
     let len = info
         .byte_len()
         .ok_or_else(|| ModelError::Shape(format!("unsupported lora tensor type {name}")))?;
+    let offset = usize::try_from(info.offset)
+        .map_err(|_| ModelError::Shape(format!("lora tensor offset {name}")))?;
     let start = data_offset
-        + usize::try_from(info.offset)
-            .map_err(|_| ModelError::Shape(format!("lora tensor offset {name}")))?;
-    if start.checked_add(len).is_none_or(|end| end > bytes.len()) {
+        .checked_add(offset)
+        .ok_or_else(|| ModelError::Shape(format!("lora tensor offset overflow: {name}")))?;
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| ModelError::Shape(format!("lora tensor length overflow: {name}")))?;
+    if end > bytes.len() {
         return Err(ModelError::Shape(format!(
             "lora tensor out of bounds: {name}"
         )));
@@ -294,15 +324,30 @@ fn resolve(
     Ok(Resolved { info, start, len })
 }
 
-fn info_cols(info: &TensorInfo) -> usize {
-    info.dims.first().copied().unwrap_or(0) as usize
+fn info_dim(info: &TensorInfo, index: usize) -> Result<usize, ModelError> {
+    let value = info.dims.get(index).copied().ok_or_else(|| {
+        ModelError::Shape(format!(
+            "lora tensor {} has no dimension {index}",
+            info.name
+        ))
+    })?;
+    usize::try_from(value).map_err(|_| {
+        ModelError::Shape(format!(
+            "lora tensor {} dimension {index} is too large",
+            info.name
+        ))
+    })
 }
 
-fn info_rows(info: &TensorInfo) -> usize {
+fn info_cols(info: &TensorInfo) -> Result<usize, ModelError> {
+    info_dim(info, 0)
+}
+
+fn info_rows(info: &TensorInfo) -> Result<usize, ModelError> {
     if info.dims.len() >= 2 {
-        info.dims[1] as usize
+        info_dim(info, 1)
     } else {
-        1
+        Ok(1)
     }
 }
 
@@ -314,20 +359,20 @@ fn check_pair(
     base: &DllmConfig,
 ) -> Result<(), ModelError> {
     let (in_dim, out_dim) = module.dims(base);
-    if info_cols(&a.info) != in_dim || info_rows(&a.info) != rank {
+    let a_cols = info_cols(&a.info)?;
+    let a_rows = info_rows(&a.info)?;
+    if a_cols != in_dim || a_rows != rank {
         return Err(ModelError::Shape(format!(
-            "lora {} A shape: expected [{in_dim}, {rank}], got [{}, {}]",
-            module.suffix(),
-            info_cols(&a.info),
-            info_rows(&a.info)
+            "lora {} A shape: expected [{in_dim}, {rank}], got [{a_cols}, {a_rows}]",
+            module.suffix()
         )));
     }
-    if info_cols(&b.info) != rank || info_rows(&b.info) != out_dim {
+    let b_cols = info_cols(&b.info)?;
+    let b_rows = info_rows(&b.info)?;
+    if b_cols != rank || b_rows != out_dim {
         return Err(ModelError::Shape(format!(
-            "lora {} B shape: expected [{rank}, {out_dim}], got [{}, {}]",
-            module.suffix(),
-            info_cols(&b.info),
-            info_rows(&b.info)
+            "lora {} B shape: expected [{rank}, {out_dim}], got [{b_cols}, {b_rows}]",
+            module.suffix()
         )));
     }
     Ok(())

@@ -240,6 +240,15 @@ fn build_gguf_with_key_length(
 }
 
 fn write_gguf(specs: Vec<TensorSpec>, metadata: Vec<u8>, metadata_count: u64) -> Vec<u8> {
+    write_gguf_with_offset(specs, metadata, metadata_count, None)
+}
+
+fn write_gguf_with_offset(
+    specs: Vec<TensorSpec>,
+    metadata: Vec<u8>,
+    metadata_count: u64,
+    first_offset: Option<u64>,
+) -> Vec<u8> {
     let mut offsets = Vec::with_capacity(specs.len());
     let mut cursor = 0usize;
     for spec in &specs {
@@ -254,14 +263,19 @@ fn write_gguf(specs: Vec<TensorSpec>, metadata: Vec<u8>, metadata_count: u64) ->
     out.extend_from_slice(&metadata_count.to_le_bytes());
     out.extend_from_slice(&metadata);
 
-    for (spec, offset) in specs.iter().zip(&offsets) {
+    for (index, (spec, offset)) in specs.iter().zip(&offsets).enumerate() {
         put_string(&mut out, &spec.name);
         out.extend_from_slice(&(spec.dims.len() as u32).to_le_bytes());
         for dim in &spec.dims {
             out.extend_from_slice(&dim.to_le_bytes());
         }
         out.extend_from_slice(&F32_TYPE.to_le_bytes());
-        out.extend_from_slice(&(*offset as u64).to_le_bytes());
+        let written = if index == 0 {
+            first_offset.unwrap_or(*offset as u64)
+        } else {
+            *offset as u64
+        };
+        out.extend_from_slice(&written.to_le_bytes());
     }
 
     let data_start = align_up(out.len(), ALIGNMENT);
@@ -368,6 +382,104 @@ fn build_lora_unknown_module() -> Vec<u8> {
         ],
         metadata,
         4,
+    )
+}
+
+fn build_lora_fixed_ffn_down(alpha: f32) -> Vec<u8> {
+    let mut metadata = Vec::new();
+    put_kv_u32(&mut metadata, "general.alignment", ALIGNMENT as u32);
+    put_kv_string(&mut metadata, "general.architecture", "qwen3-dllm-lora");
+    put_kv_u32(&mut metadata, "qwen3-dllm-lora.rank", 2);
+    put_kv_f32(&mut metadata, "qwen3-dllm-lora.alpha", alpha);
+    let mut a = matrix("blk.1.ffn_down.lora_a.weight", 32, 2, 0);
+    a.values.fill(0.0);
+    a.values[0] = 1.0; // row 0, col 0
+    a.values[33] = 1.0; // row 1, col 1
+    let mut b = matrix("blk.1.ffn_down.lora_b.weight", 2, 16, 0);
+    b.values.fill(0.0);
+    b.values[0] = 2.0; // row 0, col 0
+    b.values[3] = 3.0; // row 1, col 1
+    write_gguf(vec![a, b], metadata, 4)
+}
+
+fn build_lora_misnamed() -> Vec<u8> {
+    let mut metadata = Vec::new();
+    put_kv_u32(&mut metadata, "general.alignment", ALIGNMENT as u32);
+    put_kv_string(&mut metadata, "general.architecture", "qwen3-dllm-lora");
+    put_kv_u32(&mut metadata, "qwen3-dllm-lora.rank", 2);
+    put_kv_f32(&mut metadata, "qwen3-dllm-lora.alpha", 4.0);
+    write_gguf(
+        vec![
+            matrix("blk.0.attn_q.lora_a.weight", 8, 2, 51),
+            matrix("blk.0.attn_q.lora_b.weight", 2, 8, 52),
+            matrix("blk.0.ffn_up.lora_A.weight", 8, 2, 53),
+            matrix("blk.0.ffn_up.lora_B.weight", 2, 16, 54),
+        ],
+        metadata,
+        4,
+    )
+}
+
+fn build_lora_noncanonical() -> Vec<u8> {
+    let mut metadata = Vec::new();
+    put_kv_u32(&mut metadata, "general.alignment", ALIGNMENT as u32);
+    put_kv_string(&mut metadata, "general.architecture", "qwen3-dllm-lora");
+    put_kv_u32(&mut metadata, "qwen3-dllm-lora.rank", 2);
+    put_kv_f32(&mut metadata, "qwen3-dllm-lora.alpha", 4.0);
+    write_gguf(
+        vec![
+            matrix("blk.00.attn_q.lora_a.weight", 8, 2, 61),
+            matrix("blk.00.attn_q.lora_b.weight", 2, 8, 62),
+        ],
+        metadata,
+        4,
+    )
+}
+
+fn build_lora_overflow_offset() -> Vec<u8> {
+    let mut metadata = Vec::new();
+    put_kv_u32(&mut metadata, "general.alignment", ALIGNMENT as u32);
+    put_kv_string(&mut metadata, "general.architecture", "qwen3-dllm-lora");
+    put_kv_u32(&mut metadata, "qwen3-dllm-lora.rank", 2);
+    put_kv_f32(&mut metadata, "qwen3-dllm-lora.alpha", 4.0);
+    write_gguf_with_offset(
+        vec![
+            matrix("blk.0.attn_q.lora_a.weight", 8, 2, 71),
+            matrix("blk.0.attn_q.lora_b.weight", 2, 8, 72),
+        ],
+        metadata,
+        4,
+        Some(u64::MAX),
+    )
+}
+
+fn build_lora_default_alpha() -> Vec<u8> {
+    let mut metadata = Vec::new();
+    put_kv_u32(&mut metadata, "general.alignment", ALIGNMENT as u32);
+    put_kv_string(&mut metadata, "general.architecture", "qwen3-dllm-lora");
+    put_kv_u32(&mut metadata, "qwen3-dllm-lora.rank", 2);
+    write_gguf(
+        vec![
+            matrix("blk.0.attn_q.lora_a.weight", 8, 2, 81),
+            matrix("blk.0.attn_q.lora_b.weight", 2, 8, 82),
+        ],
+        metadata,
+        3,
+    )
+}
+
+fn build_lora_without_rank() -> Vec<u8> {
+    let mut metadata = Vec::new();
+    put_kv_u32(&mut metadata, "general.alignment", ALIGNMENT as u32);
+    put_kv_string(&mut metadata, "general.architecture", "qwen3-dllm-lora");
+    put_kv_f32(&mut metadata, "qwen3-dllm-lora.alpha", 4.0);
+    write_gguf(
+        vec![
+            matrix("blk.0.attn_q.lora_a.weight", 8, 2, 91),
+            matrix("blk.0.attn_q.lora_b.weight", 2, 8, 92),
+        ],
+        metadata,
+        3,
     )
 }
 
@@ -677,17 +789,84 @@ fn lora_rejects_empty_unknown_and_extra_layers() {
 }
 
 #[test]
-fn lora_rejects_invalid_metadata() {
+fn lora_apply_ffn_down_layer_one_matches_hand_computed() {
+    let base_bytes = build_hardened_model();
+    let config = base_config(&base_bytes);
+    let lora = lora_from(build_lora_fixed_ffn_down(4.0), &config);
+    assert_eq!(lora.pair_count(), 1);
+    let mut input = vec![0.0f32; 32];
+    input[0] = 1.0;
+    input[1] = 2.0;
+    let mut out = [0.0f32; 16];
+    lora.apply(1, LoraModule::FfnDown, &input, 1, &mut out)
+        .expect("apply layer 1");
+    let mut expected = [0.0f32; 16];
+    expected[0] = 4.0;
+    expected[1] = 12.0;
+    assert_close(&out, &expected);
+
+    // The adapter only targets layer 1, so layer 0 must be a no-op.
+    let mut untouched = [0.0f32; 16];
+    lora.apply(0, LoraModule::FfnDown, &input, 1, &mut untouched)
+        .expect("apply layer 0");
+    assert_eq!(untouched, [0.0f32; 16]);
+}
+
+#[test]
+fn lora_rejects_misnamed_and_noncanonical_tensors() {
     let base_bytes = build_model(false);
     let config = base_config(&base_bytes);
 
-    let zero_rank = build_lora(0, 0, 2, 4.0, false, false);
-    let gguf = Gguf::parse(&zero_rank).expect("parse zero rank");
-    assert!(LoraModel::from_gguf(gguf, zero_rank, &config).is_err());
+    for (bytes, needle) in [
+        (build_lora_misnamed(), "malformed lora tensor name"),
+        (build_lora_noncanonical(), "non-canonical lora tensor name"),
+    ] {
+        let gguf = Gguf::parse(&bytes).expect("parse lora");
+        let Err(error) = LoraModel::from_gguf(gguf, bytes, &config) else {
+            panic!("expected an error");
+        };
+        assert!(error.to_string().contains(needle), "{error}");
+    }
+}
 
-    let zero_alpha = build_lora(0, 2, 2, 0.0, false, false);
-    let gguf = Gguf::parse(&zero_alpha).expect("parse zero alpha");
-    assert!(LoraModel::from_gguf(gguf, zero_alpha, &config).is_err());
+#[test]
+fn lora_rejects_offset_overflow() {
+    let base_bytes = build_model(false);
+    let config = base_config(&base_bytes);
+    let bytes = build_lora_overflow_offset();
+    let gguf = Gguf::parse(&bytes).expect("parse lora");
+    let Err(error) = LoraModel::from_gguf(gguf, bytes, &config) else {
+        panic!("expected an error");
+    };
+    assert!(error.to_string().contains("overflow"), "{error}");
+}
+
+#[test]
+fn lora_metadata_defaults_and_errors() {
+    let base_bytes = build_model(false);
+    let config = base_config(&base_bytes);
+
+    let default_alpha = lora_from(build_lora_default_alpha(), &config);
+    assert!((default_alpha.scale() - 1.0).abs() < 1e-6);
+
+    let missing = build_lora_without_rank();
+    let gguf = Gguf::parse(&missing).expect("parse missing rank");
+    let Err(error) = LoraModel::from_gguf(gguf, missing, &config) else {
+        panic!("expected an error");
+    };
+    assert!(error.to_string().contains("rank"), "{error}");
+
+    for (bytes, needle) in [
+        (build_lora(0, 0, 2, 4.0, false, false), "rank"),
+        (build_lora(0, 2, 2, 0.0, false, false), "alpha"),
+        (build_lora(0, 2, 2, f32::NAN, false, false), "alpha"),
+    ] {
+        let gguf = Gguf::parse(&bytes).expect("parse bad metadata");
+        let Err(error) = LoraModel::from_gguf(gguf, bytes, &config) else {
+            panic!("expected an error");
+        };
+        assert!(error.to_string().contains(needle), "{error}");
+    }
 }
 
 #[test]
