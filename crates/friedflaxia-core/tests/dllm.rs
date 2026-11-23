@@ -1,8 +1,8 @@
 use friedflaxia_core::gguf::{Gguf, TensorType};
 use friedflaxia_core::models::dllm::{
-    denoise_step, denoise_step_with_lora, denoise_topk, denoise_topk_with_lora,
+    DllmConfig, denoise_step, denoise_step_with_lora, denoise_topk, denoise_topk_with_lora,
 };
-use friedflaxia_core::models::lora::LoraModel;
+use friedflaxia_core::models::lora::{LoraModel, LoraModule};
 
 const ALIGNMENT: usize = 32;
 const GGUF_VERSION: u32 = 3;
@@ -275,16 +275,34 @@ fn write_gguf(specs: Vec<TensorSpec>, metadata: Vec<u8>, metadata_count: u64) ->
     out
 }
 
-/// One-layer adapter on the simple model's attn_q projection.
-fn build_lora(rank: usize, tensor_rank: usize, alpha: f32, zero_b: bool, only_a: bool) -> Vec<u8> {
+/// One adapter pair on `blk.{layer}.attn_q`.
+#[allow(clippy::too_many_arguments)]
+fn build_lora(
+    layer: usize,
+    rank: usize,
+    tensor_rank: usize,
+    alpha: f32,
+    zero_b: bool,
+    only_a: bool,
+) -> Vec<u8> {
     let mut metadata = Vec::new();
     put_kv_u32(&mut metadata, "general.alignment", ALIGNMENT as u32);
     put_kv_string(&mut metadata, "general.architecture", "qwen3-dllm-lora");
     put_kv_u32(&mut metadata, "qwen3-dllm-lora.rank", rank as u32);
     put_kv_f32(&mut metadata, "qwen3-dllm-lora.alpha", alpha);
-    let mut specs = vec![matrix("blk.0.attn_q.lora_a.weight", 8, tensor_rank, 21)];
+    let mut specs = vec![matrix(
+        &format!("blk.{layer}.attn_q.lora_a.weight"),
+        8,
+        tensor_rank,
+        21,
+    )];
     if !only_a {
-        let mut b = matrix("blk.0.attn_q.lora_b.weight", tensor_rank, 8, 22);
+        let mut b = matrix(
+            &format!("blk.{layer}.attn_q.lora_b.weight"),
+            tensor_rank,
+            8,
+            22,
+        );
         if zero_b {
             b.values.fill(0.0);
         }
@@ -293,9 +311,74 @@ fn build_lora(rank: usize, tensor_rank: usize, alpha: f32, zero_b: bool, only_a:
     write_gguf(specs, metadata, 4)
 }
 
-fn lora_from(bytes: Vec<u8>) -> LoraModel {
+/// A hand-computable adapter: A selects x0/x1, B scales them by 2 and 3.
+fn build_lora_fixed(alpha: f32) -> Vec<u8> {
+    let mut metadata = Vec::new();
+    put_kv_u32(&mut metadata, "general.alignment", ALIGNMENT as u32);
+    put_kv_string(&mut metadata, "general.architecture", "qwen3-dllm-lora");
+    put_kv_u32(&mut metadata, "qwen3-dllm-lora.rank", 2);
+    put_kv_f32(&mut metadata, "qwen3-dllm-lora.alpha", alpha);
+    let mut a = matrix("blk.0.attn_q.lora_a.weight", 8, 2, 0);
+    a.values.fill(0.0);
+    a.values[0] = 1.0; // row 0, col 0
+    a.values[9] = 1.0; // row 1, col 1
+    let mut b = matrix("blk.0.attn_q.lora_b.weight", 2, 8, 0);
+    b.values.fill(0.0);
+    b.values[0] = 2.0; // row 0, col 0
+    b.values[3] = 3.0; // row 1, col 1
+    write_gguf(vec![a, b], metadata, 4)
+}
+
+/// Adapter for the hardened model's second layer, ffn_down.
+fn build_lora_hardened() -> Vec<u8> {
+    let mut metadata = Vec::new();
+    put_kv_u32(&mut metadata, "general.alignment", ALIGNMENT as u32);
+    put_kv_string(&mut metadata, "general.architecture", "qwen3-dllm-lora");
+    put_kv_u32(&mut metadata, "qwen3-dllm-lora.rank", 2);
+    put_kv_f32(&mut metadata, "qwen3-dllm-lora.alpha", 4.0);
+    write_gguf(
+        vec![
+            matrix("blk.1.ffn_down.lora_a.weight", 32, 2, 31),
+            matrix("blk.1.ffn_down.lora_b.weight", 2, 16, 32),
+        ],
+        metadata,
+        4,
+    )
+}
+
+fn build_lora_empty() -> Vec<u8> {
+    let mut metadata = Vec::new();
+    put_kv_u32(&mut metadata, "general.alignment", ALIGNMENT as u32);
+    put_kv_string(&mut metadata, "general.architecture", "qwen3-dllm-lora");
+    put_kv_u32(&mut metadata, "qwen3-dllm-lora.rank", 2);
+    put_kv_f32(&mut metadata, "qwen3-dllm-lora.alpha", 4.0);
+    write_gguf(Vec::new(), metadata, 4)
+}
+
+fn build_lora_unknown_module() -> Vec<u8> {
+    let mut metadata = Vec::new();
+    put_kv_u32(&mut metadata, "general.alignment", ALIGNMENT as u32);
+    put_kv_string(&mut metadata, "general.architecture", "qwen3-dllm-lora");
+    put_kv_u32(&mut metadata, "qwen3-dllm-lora.rank", 2);
+    put_kv_f32(&mut metadata, "qwen3-dllm-lora.alpha", 4.0);
+    write_gguf(
+        vec![
+            matrix("blk.0.q_proj.lora_a.weight", 8, 2, 41),
+            matrix("blk.0.q_proj.lora_b.weight", 2, 8, 42),
+        ],
+        metadata,
+        4,
+    )
+}
+
+fn base_config(bytes: &[u8]) -> DllmConfig {
+    let gguf = Gguf::parse(bytes).expect("parse base");
+    DllmConfig::from_gguf(&gguf).expect("base config")
+}
+
+fn lora_from(bytes: Vec<u8>, base: &DllmConfig) -> LoraModel {
     let gguf = Gguf::parse(&bytes).expect("parse lora");
-    LoraModel::from_gguf(gguf, bytes, 1).expect("load lora")
+    LoraModel::from_gguf(gguf, bytes, base).expect("load lora")
 }
 
 fn build_model(tie_output: bool) -> Vec<u8> {
@@ -479,12 +562,14 @@ fn scoring_a_prefix_position_is_allowed() {
 fn zero_lora_matches_the_base_model() {
     let bytes = build_model(false);
     let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
+    let config = base_config(&bytes);
     let tokens = [1, 2, 3, 4];
     let positions = [2, 3];
     let base = denoise_step(&gguf, &bytes, &tokens, &positions, (2, 4)).expect("base");
-    let lora = lora_from(build_lora(2, 2, 4.0, true, false));
+    let lora = lora_from(build_lora(0, 2, 2, 4.0, true, false), &config);
     assert_eq!(lora.rank(), 2);
     assert!((lora.scale() - 2.0).abs() < 1e-6);
+    assert_eq!(lora.pair_count(), 1);
     let adapted = denoise_step_with_lora(&gguf, &bytes, &tokens, &positions, (2, 4), Some(&lora))
         .expect("lora");
     assert_close(&base.logits, &adapted.logits);
@@ -494,10 +579,11 @@ fn zero_lora_matches_the_base_model() {
 fn nonzero_lora_changes_logits() {
     let bytes = build_model(false);
     let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
+    let config = base_config(&bytes);
     let tokens = [1, 2, 3, 4];
     let positions = [2, 3];
     let base = denoise_step(&gguf, &bytes, &tokens, &positions, (2, 4)).expect("base");
-    let lora = lora_from(build_lora(2, 2, 4.0, false, false));
+    let lora = lora_from(build_lora(0, 2, 2, 4.0, false, false), &config);
     let adapted = denoise_step_with_lora(&gguf, &bytes, &tokens, &positions, (2, 4), Some(&lora))
         .expect("lora");
     assert_ne!(base.logits, adapted.logits);
@@ -508,10 +594,11 @@ fn nonzero_lora_changes_logits() {
 fn zero_lora_topk_matches_the_base() {
     let bytes = build_model(false);
     let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
+    let config = base_config(&bytes);
     let tokens = [1, 2, 3, 4];
     let positions = [2, 3];
     let base = denoise_topk(&gguf, &bytes, &tokens, &positions, (2, 4), 2).expect("base");
-    let lora = lora_from(build_lora(2, 2, 4.0, true, false));
+    let lora = lora_from(build_lora(0, 2, 2, 4.0, true, false), &config);
     let adapted =
         denoise_topk_with_lora(&gguf, &bytes, &tokens, &positions, (2, 4), 2, Some(&lora))
             .expect("lora");
@@ -520,18 +607,87 @@ fn zero_lora_topk_matches_the_base() {
 }
 
 #[test]
-fn lora_rejects_half_a_pair_and_bad_shapes() {
-    let bytes = build_lora(2, 2, 4.0, false, true);
-    let gguf = Gguf::parse(&bytes).expect("parse half lora");
-    assert!(LoraModel::from_gguf(gguf, bytes, 1).is_err());
+fn lora_apply_matches_a_hand_computed_projection() {
+    let base_bytes = build_model(false);
+    let config = base_config(&base_bytes);
+    let lora = lora_from(build_lora_fixed(4.0), &config);
+    let input = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+    let mut out = [0.0f32; 8];
+    lora.apply(0, LoraModule::AttnQ, &input, 1, &mut out)
+        .expect("apply");
+    // A picks x0/x1, B scales them by 2/3, and scale = alpha/rank = 2.
+    assert_close(&out, &[4.0, 12.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+}
 
-    let base = build_model(false);
-    let gguf = Gguf::parse(&base).expect("parse tiny dLLM");
-    // Metadata rank 2 but the tensors have rank 3.
-    let lora = lora_from(build_lora(2, 3, 4.0, false, false));
-    let error = denoise_step_with_lora(&gguf, &base, &[1, 2, 3, 4], &[2, 3], (2, 4), Some(&lora))
-        .unwrap_err();
-    assert!(error.to_string().contains("A shape"), "{error}");
+#[test]
+fn lora_applies_to_a_second_layer_ffn_down() {
+    let bytes = build_hardened_model();
+    let gguf = Gguf::parse(&bytes).expect("parse hardened dLLM");
+    let config = base_config(&bytes);
+    let lora = lora_from(build_lora_hardened(), &config);
+    assert_eq!(lora.pair_count(), 1);
+    let tokens = [1, 2, 3, 4, 0, 1, 2, 3];
+    let positions = [0, 4, 7];
+    let base = denoise_step(&gguf, &bytes, &tokens, &positions, (0, 8)).expect("base");
+    let adapted = denoise_step_with_lora(&gguf, &bytes, &tokens, &positions, (0, 8), Some(&lora))
+        .expect("lora");
+    assert_ne!(base.logits, adapted.logits);
+    assert!(adapted.logits.iter().all(|value| value.is_finite()));
+}
+
+#[test]
+fn lora_rejects_half_a_pair_and_bad_shapes() {
+    let base_bytes = build_model(false);
+    let config = base_config(&base_bytes);
+
+    let half = build_lora(0, 2, 2, 4.0, false, true);
+    let gguf = Gguf::parse(&half).expect("parse half lora");
+    assert!(LoraModel::from_gguf(gguf, half, &config).is_err());
+
+    let bad = build_lora(0, 2, 3, 4.0, false, false);
+    let gguf = Gguf::parse(&bad).expect("parse bad lora");
+    assert!(LoraModel::from_gguf(gguf, bad, &config).is_err());
+}
+
+#[test]
+fn lora_rejects_empty_unknown_and_extra_layers() {
+    let base_bytes = build_model(false);
+    let config = base_config(&base_bytes);
+
+    let empty = build_lora_empty();
+    let gguf = Gguf::parse(&empty).expect("parse empty lora");
+    let Err(error) = LoraModel::from_gguf(gguf, empty, &config) else {
+        panic!("expected an error");
+    };
+    assert!(error.to_string().contains("matched no modules"), "{error}");
+
+    let unknown = build_lora_unknown_module();
+    let gguf = Gguf::parse(&unknown).expect("parse unknown lora");
+    let Err(error) = LoraModel::from_gguf(gguf, unknown, &config) else {
+        panic!("expected an error");
+    };
+    assert!(error.to_string().contains("unsupported module"), "{error}");
+
+    let extra = build_lora(1, 2, 2, 4.0, false, false);
+    let gguf = Gguf::parse(&extra).expect("parse extra lora");
+    let Err(error) = LoraModel::from_gguf(gguf, extra, &config) else {
+        panic!("expected an error");
+    };
+    assert!(error.to_string().contains("has layer 1"), "{error}");
+}
+
+#[test]
+fn lora_rejects_invalid_metadata() {
+    let base_bytes = build_model(false);
+    let config = base_config(&base_bytes);
+
+    let zero_rank = build_lora(0, 0, 2, 4.0, false, false);
+    let gguf = Gguf::parse(&zero_rank).expect("parse zero rank");
+    assert!(LoraModel::from_gguf(gguf, zero_rank, &config).is_err());
+
+    let zero_alpha = build_lora(0, 2, 2, 0.0, false, false);
+    let gguf = Gguf::parse(&zero_alpha).expect("parse zero alpha");
+    assert!(LoraModel::from_gguf(gguf, zero_alpha, &config).is_err());
 }
 
 #[test]

@@ -183,7 +183,7 @@ impl Engine {
             .map_err(|error| EngineError::new(error.to_string()))?;
         let lora_gguf = Gguf::parse_with_options(&lora_bytes, ParseOptions::default())
             .map_err(|error| EngineError::new(error.to_string()))?;
-        let lora = LoraModel::from_gguf(lora_gguf, lora_bytes, config.n_layer)
+        let lora = LoraModel::from_gguf(lora_gguf, lora_bytes, &config)
             .map_err(|error| EngineError::new(error.to_string()))?;
         engine.lora = Some(lora);
         Ok(engine)
@@ -461,16 +461,19 @@ impl Model {
 
     /// Load a base dLLM and a LoRA adapter in one step.
     #[wasm_bindgen(js_name = withLora)]
-    pub fn with_lora(base_bytes: Vec<u8>, lora_bytes: Vec<u8>) -> Result<Model, JsValue> {
-        Engine::with_lora(base_bytes, lora_bytes)
+    #[allow(non_snake_case)]
+    pub fn with_lora(baseBytes: Vec<u8>, loraBytes: Vec<u8>) -> Result<Model, JsValue> {
+        Engine::with_lora(baseBytes, loraBytes)
             .map(|engine| Model { engine })
             .map_err(js_error)
     }
 
+    #[wasm_bindgen(js_name = loraRank)]
     pub fn lora_rank(&self) -> Option<usize> {
         self.engine.lora_rank()
     }
 
+    #[wasm_bindgen(js_name = loraExpert)]
     pub fn lora_expert(&self) -> Option<String> {
         self.engine.lora_expert()
     }

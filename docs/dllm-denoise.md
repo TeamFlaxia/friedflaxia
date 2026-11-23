@@ -70,8 +70,10 @@ blk.{i}.attn_q.lora_b.weight      [rank, out]
 
 Each projection becomes `W x + (alpha / rank) * B (A x)`. Modules without
 tensors are left untouched; a module with only one of `lora_a`/`lora_b` is
-rejected. A zero `lora_b` is a verified no-op. `Model.withLora` loads the adapter
-next to the base model, and `loraRank`/`loraExpert` expose its identity for node
+rejected. Unknown module suffixes, layers beyond the base model, rank/shape
+mismatches, and an adapter that matches no modules are rejected at load time.
+A zero `lora_b` is a verified no-op. `Model.withLora` loads the adapter next to
+the base model, and `loraRank`/`loraExpert` expose its identity for node
 reporting and delta attribution.
 
 ## Still missing
