@@ -147,7 +147,7 @@ impl Engine {
             TokenizerSpec::from_gguf(&gguf)
                 .ok()
                 .and_then(|spec| match spec.model.as_str() {
-                    "gpt2" | "gemma4" => BpeTokenizer::from_spec(&spec)
+                    "gpt2" | "gemma4" | "qwen3" => BpeTokenizer::from_spec(&spec)
                         .ok()
                         .map(|tokenizer| Tokenizer::Bpe(Box::new(tokenizer))),
                     "plamo3" => UnigramTokenizer::from_spec(&spec)
@@ -734,7 +734,7 @@ impl MultimodalModel {
             TokenizerSpec::from_gguf(&text_gguf)
                 .ok()
                 .and_then(|spec| match spec.model.as_str() {
-                    "gpt2" | "gemma4" => BpeTokenizer::from_spec(&spec)
+                    "gpt2" | "gemma4" | "qwen3" => BpeTokenizer::from_spec(&spec)
                         .ok()
                         .map(|tokenizer| Tokenizer::Bpe(Box::new(tokenizer))),
                     _ => None,
@@ -843,7 +843,7 @@ impl D1MultimodalModel {
             TokenizerSpec::from_gguf(&text_gguf)
                 .ok()
                 .and_then(|spec| match spec.model.as_str() {
-                    "gpt2" | "gemma4" => BpeTokenizer::from_spec(&spec)
+                    "gpt2" | "gemma4" | "qwen3" => BpeTokenizer::from_spec(&spec)
                         .ok()
                         .map(|tokenizer| Tokenizer::Bpe(Box::new(tokenizer))),
                     "plamo3" => UnigramTokenizer::from_spec(&spec)
