@@ -938,6 +938,24 @@ fn real_dllm_denoise_smoke() {
     let bytes = std::fs::read(path).expect("read dLLM GGUF");
     let gguf = Gguf::parse(&bytes).expect("parse dLLM GGUF");
     let config = friedflaxia_core::models::dllm::DllmConfig::from_gguf(&gguf).expect("config");
+
+    // The Theia executor depends on the qwen3 tokenizer mode and on control
+    // tokens being matched verbatim rather than split into characters.
+    let spec =
+        friedflaxia_core::gguf::tokenizer::TokenizerSpec::from_gguf(&gguf).expect("tokenizer spec");
+    assert_eq!(spec.model, "qwen3");
+    let tokenizer =
+        friedflaxia_core::tokenizer::BpeTokenizer::from_spec(&spec).expect("qwen3 tokenizer");
+    assert_eq!(tokenizer.token_id("<|mask|>"), Some(151_669));
+    assert_eq!(tokenizer.token_id("<|im_start|>"), Some(151_644));
+    assert_eq!(
+        tokenizer
+            .encode("<|im_start|>user<|im_end|>", false)
+            .unwrap(),
+        vec![151_644, 872, 151_645]
+    );
+    // Qwen3 splits each digit instead of GPT-2's three-digit runs.
+    assert_eq!(tokenizer.encode("12", false).unwrap().len(), 2);
     let tokens: Vec<u32> = vec![0; 8];
     let positions: Vec<usize> = (0..8).collect();
     let started = std::time::Instant::now();

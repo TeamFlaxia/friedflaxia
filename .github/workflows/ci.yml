@@ -180,6 +180,34 @@ jobs:
             cargo test --release --test nudenet -- --ignored --nocapture
           cargo test --release --test nudenet -- --nocapture
 
+  dllm-parity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      MODEL_URL: https://huggingface.co/RemydreScarlet/qwen3-0.6b-diffusion-bd3lm-GGUF/resolve/fd3fb1978befe31cff16ab6cfcd4d5184cca0e9b/qwen3-bd3lm-q4_0.gguf
+      MODEL_SHA256: 0f13278bde4d700118c8cf13d293af897a8974e74293de887aa383c567352a8e
+      MODEL_PATH: ${{ github.workspace }}/.cache/qwen3-bd3lm-q4_0.gguf
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache the pinned dLLM GGUF
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.cache/qwen3-bd3lm-q4_0.gguf
+          key: dllm-q4_0-${{ env.MODEL_SHA256 }}
+      - name: Download and verify the GGUF
+        run: |
+          mkdir -p "$(dirname "$MODEL_PATH")"
+          if [ ! -f "$MODEL_PATH" ]; then
+            curl -fL --retry 3 -o "$MODEL_PATH" "$MODEL_URL"
+          fi
+          echo "$MODEL_SHA256  $MODEL_PATH" | sha256sum -c -
+      - name: Run the dLLM smoke test and the Qwen3 tokenizer contract
+        run: |
+          FRIEDFLAXIA_DLLM_GGUF="$MODEL_PATH" \
+            cargo test --release --test dllm -- --ignored --nocapture
+          cargo test --release --test dllm -- --nocapture
+
   plamo-parity:
     runs-on: ubuntu-latest
     timeout-minutes: 25

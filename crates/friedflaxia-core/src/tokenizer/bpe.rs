@@ -7,9 +7,14 @@ use std::sync::OnceLock;
 /// GPT-2-style word split used by the d1-omni tokenizer.
 const GPT2_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
+/// Qwen3's byte-level split. It differs from GPT-2 only in `\p{N}`: Qwen
+/// splits every digit, so "42" is two tokens instead of one three-digit run.
+const QWEN3_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BpeMode {
     Gpt2,
+    Qwen3,
     Gemma,
 }
 
@@ -18,6 +23,8 @@ pub struct BpeTokenizer {
     merges: HashMap<(String, String), u32>,
     token_types: Vec<TokenType>,
     tokens: Vec<String>,
+    /// Control/added tokens, longest first, matched before BPE in qwen3 mode.
+    specials: Vec<(String, u32)>,
     mode: BpeMode,
     bos_token_id: u32,
     eos_token_id: u32,
@@ -29,6 +36,7 @@ impl BpeTokenizer {
     pub fn from_spec(spec: &TokenizerSpec) -> Result<Self> {
         let mode = match spec.model.as_str() {
             "gpt2" => BpeMode::Gpt2,
+            "qwen3" => BpeMode::Qwen3,
             model if model.starts_with("gemma") => BpeMode::Gemma,
             _ => return Err(TokenizerError::UnsupportedModel(spec.model.clone())),
         };
@@ -43,11 +51,24 @@ impl BpeTokenizer {
             };
             merges.insert((left.to_owned(), right.to_owned()), rank as u32);
         }
+        let mut specials: Vec<(String, u32)> = spec
+            .tokens
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| {
+                spec.token_types
+                    .get(*index)
+                    .is_some_and(|token_type| *token_type == TokenType::Control)
+            })
+            .map(|(index, token)| (token.clone(), index as u32))
+            .collect();
+        specials.sort_by_key(|(token, _)| std::cmp::Reverse(token.len()));
         Ok(Self {
             vocab,
             merges,
             token_types: spec.token_types.clone(),
             tokens: spec.tokens.clone(),
+            specials,
             mode,
             bos_token_id: spec.bos_token_id,
             eos_token_id: spec.eos_token_id,
@@ -64,6 +85,7 @@ impl BpeTokenizer {
             ids.push(self.bos_token_id);
         }
         match self.mode {
+            BpeMode::Qwen3 => self.encode_qwen3(text, &mut ids)?,
             BpeMode::Gpt2 => {
                 let regex = gpt2_regex()?;
                 for word in regex.find_iter(text) {
@@ -86,7 +108,7 @@ impl BpeTokenizer {
 
     pub fn decode(&self, ids: &[u32]) -> Result<String> {
         match self.mode {
-            BpeMode::Gpt2 => {
+            BpeMode::Gpt2 | BpeMode::Qwen3 => {
                 let mut bytes = Vec::new();
                 for id in ids {
                     if self.is_special(*id) {
@@ -120,6 +142,48 @@ impl BpeTokenizer {
                 Ok(text.replace('▁', " "))
             }
         }
+    }
+
+    /// Qwen3 tokenization: added/control tokens are matched verbatim before
+    /// the byte-level BPE, the same way Hugging Face's AddedVocabulary does.
+    /// Without this, `<|im_start|>` is split into ordinary characters.
+    fn encode_qwen3(&self, text: &str, ids: &mut Vec<u32>) -> Result<()> {
+        let regex = qwen3_regex()?;
+        let mut last = 0usize;
+        let mut cursor = 0usize;
+        while cursor < text.len() {
+            if let Some((special, id)) = self
+                .specials
+                .iter()
+                .find(|(special, _)| text[cursor..].starts_with(special.as_str()))
+            {
+                if last < cursor {
+                    self.encode_qwen3_chunk(&text[last..cursor], regex, ids)?;
+                }
+                ids.push(*id);
+                cursor += special.len();
+                last = cursor;
+            } else {
+                cursor += text[cursor..]
+                    .chars()
+                    .next()
+                    .map(char::len_utf8)
+                    .unwrap_or(1);
+            }
+        }
+        if last < text.len() {
+            self.encode_qwen3_chunk(&text[last..], regex, ids)?;
+        }
+        Ok(())
+    }
+
+    fn encode_qwen3_chunk(&self, chunk: &str, regex: &Regex, ids: &mut Vec<u32>) -> Result<()> {
+        for word in regex.find_iter(chunk) {
+            let word = word.map_err(|error| TokenizerError::InvalidPattern(error.to_string()))?;
+            let mapped = bytes_to_unicode_string(word.as_str().as_bytes());
+            self.encode_piece(&mapped, ids);
+        }
+        Ok(())
     }
 
     fn encode_piece(&self, piece: &str, ids: &mut Vec<u32>) {
@@ -215,6 +279,14 @@ impl BpeTokenizer {
 fn gpt2_regex() -> Result<&'static Regex> {
     static REGEX: OnceLock<std::result::Result<Regex, String>> = OnceLock::new();
     match REGEX.get_or_init(|| Regex::new(GPT2_PATTERN).map_err(|error| error.to_string())) {
+        Ok(regex) => Ok(regex),
+        Err(error) => Err(TokenizerError::InvalidPattern(error.clone())),
+    }
+}
+
+fn qwen3_regex() -> Result<&'static Regex> {
+    static REGEX: OnceLock<std::result::Result<Regex, String>> = OnceLock::new();
+    match REGEX.get_or_init(|| Regex::new(QWEN3_PATTERN).map_err(|error| error.to_string())) {
         Ok(regex) => Ok(regex),
         Err(error) => Err(TokenizerError::InvalidPattern(error.clone())),
     }
