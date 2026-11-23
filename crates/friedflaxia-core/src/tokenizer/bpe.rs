@@ -152,11 +152,11 @@ impl BpeTokenizer {
         let mut last = 0usize;
         let mut cursor = 0usize;
         while cursor < text.len() {
-            if let Some((special, id)) = self
-                .specials
-                .iter()
-                .find(|(special, _)| text[cursor..].starts_with(special.as_str()))
-            {
+            if let Some((special, id)) = self.specials.iter().find(|(special, _)| {
+                // An empty special token would match forever and never
+                // advance the cursor; refuse it defensively.
+                !special.is_empty() && text[cursor..].starts_with(special.as_str())
+            }) {
                 if last < cursor {
                     self.encode_qwen3_chunk(&text[last..cursor], regex, ids)?;
                 }

@@ -25,7 +25,9 @@ pub fn is_enabled() -> bool {
 
 /// Dot product of two equal-length slices.
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
+    // These are safe public APIs, so the equal-length precondition must hold in
+    // release builds too: the unsafe kernels index `b` using `a.len()`.
+    assert_eq!(a.len(), b.len());
     if !is_enabled() || a.len() < 8 {
         return dot_scalar(a, b);
     }
@@ -67,7 +69,7 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 /// buffer avoids a full dequantization pass. Big-endian hosts use the scalar
 /// path.
 pub fn dot_f32_le_bytes(bytes: &[u8], b: &[f32]) -> f32 {
-    debug_assert_eq!(bytes.len(), b.len() * 4);
+    assert_eq!(bytes.len(), b.len() * 4);
     let len = bytes.len() / 4;
     if !is_enabled() || len < 8 || cfg!(target_endian = "big") {
         return bytes

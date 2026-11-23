@@ -21,7 +21,6 @@ use friedflaxia_core::models::plamo3::{PlamoSession, next_token};
 use friedflaxia_core::tokenizer::{BpeTokenizer, UnigramTokenizer};
 use std::fmt;
 use std::future::Future;
-use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 
@@ -670,7 +669,10 @@ impl Model {
                 let callback = on_token.call1(&JsValue::NULL, &JsValue::from_f64(token as f64));
                 async move {
                     let value = callback.map_err(|error| EngineError::new(format!("{error:?}")))?;
-                    let promise: js_sys::Promise = value.unchecked_into();
+                    // `Promise::resolve` adopts a real Promise and wraps a
+                    // synchronous callback's return value, so a callback that
+                    // returns `undefined` no longer breaks the stream.
+                    let promise = js_sys::Promise::resolve(&value);
                     JsFuture::from(promise)
                         .await
                         .map_err(|error| EngineError::new(format!("{error:?}")))?;
