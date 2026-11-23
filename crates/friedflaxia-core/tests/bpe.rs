@@ -63,3 +63,15 @@ fn unknown_gemma_characters_fall_back_to_byte_tokens() {
     assert_eq!(tokenizer.encode("é", false).unwrap(), vec![3, 4]);
     assert_eq!(tokenizer.decode(&[3, 4]).unwrap(), "é");
 }
+
+#[test]
+fn qwen3_splits_each_digit_like_the_reference_tokenizer() {
+    let tokens = ["1", "2", "12"];
+    let merges = ["1 2"];
+    let qwen = BpeTokenizer::from_spec(&spec("qwen3", &tokens, &merges)).expect("qwen3 BPE");
+    // `\p{N}` isolates every digit, so a merge cannot span "1" and "2".
+    assert_eq!(qwen.encode("12", false).unwrap(), vec![0, 1]);
+
+    let gpt2 = BpeTokenizer::from_spec(&spec("gpt2", &tokens, &merges)).expect("gpt2 BPE");
+    assert_eq!(gpt2.encode("12", false).unwrap(), vec![2]);
+}

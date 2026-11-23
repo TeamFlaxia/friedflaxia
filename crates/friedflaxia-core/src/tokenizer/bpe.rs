@@ -7,9 +7,14 @@ use std::sync::OnceLock;
 /// GPT-2-style word split used by the d1-omni tokenizer.
 const GPT2_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
+/// Qwen3's byte-level split. It differs from GPT-2 only in `\p{N}`: Qwen
+/// splits every digit, so "42" is two tokens instead of one three-digit run.
+const QWEN3_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BpeMode {
     Gpt2,
+    Qwen3,
     Gemma,
 }
 
@@ -29,6 +34,7 @@ impl BpeTokenizer {
     pub fn from_spec(spec: &TokenizerSpec) -> Result<Self> {
         let mode = match spec.model.as_str() {
             "gpt2" => BpeMode::Gpt2,
+            "qwen3" => BpeMode::Qwen3,
             model if model.starts_with("gemma") => BpeMode::Gemma,
             _ => return Err(TokenizerError::UnsupportedModel(spec.model.clone())),
         };
@@ -64,8 +70,12 @@ impl BpeTokenizer {
             ids.push(self.bos_token_id);
         }
         match self.mode {
-            BpeMode::Gpt2 => {
-                let regex = gpt2_regex()?;
+            BpeMode::Gpt2 | BpeMode::Qwen3 => {
+                let regex = if self.mode == BpeMode::Qwen3 {
+                    qwen3_regex()?
+                } else {
+                    gpt2_regex()?
+                };
                 for word in regex.find_iter(text) {
                     let word =
                         word.map_err(|error| TokenizerError::InvalidPattern(error.to_string()))?;
@@ -86,7 +96,7 @@ impl BpeTokenizer {
 
     pub fn decode(&self, ids: &[u32]) -> Result<String> {
         match self.mode {
-            BpeMode::Gpt2 => {
+            BpeMode::Gpt2 | BpeMode::Qwen3 => {
                 let mut bytes = Vec::new();
                 for id in ids {
                     if self.is_special(*id) {
@@ -215,6 +225,14 @@ impl BpeTokenizer {
 fn gpt2_regex() -> Result<&'static Regex> {
     static REGEX: OnceLock<std::result::Result<Regex, String>> = OnceLock::new();
     match REGEX.get_or_init(|| Regex::new(GPT2_PATTERN).map_err(|error| error.to_string())) {
+        Ok(regex) => Ok(regex),
+        Err(error) => Err(TokenizerError::InvalidPattern(error.clone())),
+    }
+}
+
+fn qwen3_regex() -> Result<&'static Regex> {
+    static REGEX: OnceLock<std::result::Result<Regex, String>> = OnceLock::new();
+    match REGEX.get_or_init(|| Regex::new(QWEN3_PATTERN).map_err(|error| error.to_string())) {
         Ok(regex) => Ok(regex),
         Err(error) => Err(TokenizerError::InvalidPattern(error.clone())),
     }
