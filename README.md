@@ -96,8 +96,8 @@ Additionally:
 
 `quant::matmul_q4_0` / `matmul_q8_0` dequantize each weight block once and reuse
 it across a tile of tokens. EmbeddingGemma's encoder and PLaMO's prefill now go
-through those kernels, so the weight matrix is streamed once per layer instead of
-once per token. Single-token decode still uses the per-token kernels, so decode
+through those kernels, so the weight matrix is streamed once per 16-token tile
+instead of once per token. Single-token decode still uses the per-token kernels, so decode
 numbers are unchanged. The ignored test
 `embeddinggemma_batched_long_sequence_timing` prints the per-token cost for
 9/64/256 tokens.

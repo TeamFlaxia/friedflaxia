@@ -132,7 +132,8 @@ fn validate_matmul(
 ///
 /// The loop order is the whole point: one quantized weight block is dequantized
 /// once and then reused for every token in the tile, so the weight traffic drops
-/// by the tile width instead of streaming the matrix once per token.
+/// by the tile width instead of streaming the matrix once per token. The matrix
+/// is therefore streamed once per 16-token tile, not once per token.
 pub fn matmul_q8_0(
     weights: &[u8],
     rows: usize,
@@ -156,7 +157,8 @@ pub fn matmul_q8_0(
         out.copy_from_slice(&result);
         return Ok(());
     }
-    out.fill(0.0);
+    // Every (token, row) is written exactly once below, so the output does not
+    // need a separate zeroing pass.
     for start_token in (0..n_tokens).step_by(MATMUL_TILE_TOKENS) {
         let tile = (n_tokens - start_token).min(MATMUL_TILE_TOKENS);
         for row in 0..rows {
@@ -166,24 +168,22 @@ pub fn matmul_q8_0(
                 let bytes = &row_bytes[block * Q8_0_BLOCK_BYTES..(block + 1) * Q8_0_BLOCK_BYTES];
                 let scale = f16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]]));
                 let offset = block * QK;
-                if simd::is_enabled() {
-                    let mut dequantized = [0.0f32; QK];
-                    for (index, value) in dequantized.iter_mut().enumerate() {
-                        *value = (bytes[2 + index] as i8) as f32;
-                    }
-                    for index in 0..tile {
-                        let input_block = &inputs[(start_token + index) * cols + offset..][..QK];
-                        acc[index] += scale * simd::dot(&dequantized, input_block);
-                    }
-                } else {
-                    for index in 0..tile {
-                        let input_block = &inputs[(start_token + index) * cols + offset..][..QK];
+                let mut dequantized = [0.0f32; QK];
+                for (index, value) in dequantized.iter_mut().enumerate() {
+                    *value = (bytes[2 + index] as i8) as f32;
+                }
+                for index in 0..tile {
+                    let input_block = &inputs[(start_token + index) * cols + offset..][..QK];
+                    let dot = if simd::is_enabled() {
+                        simd::dot(&dequantized, input_block)
+                    } else {
                         let mut dot = 0.0f32;
                         for lane in 0..QK {
-                            dot += (bytes[2 + lane] as i8) as f32 * input_block[lane];
+                            dot += dequantized[lane] * input_block[lane];
                         }
-                        acc[index] += scale * dot;
-                    }
+                        dot
+                    };
+                    acc[index] += scale * dot;
                 }
             }
             for index in 0..tile {
@@ -218,7 +218,8 @@ pub fn matmul_q4_0(
         out.copy_from_slice(&result);
         return Ok(());
     }
-    out.fill(0.0);
+    // Every (token, row) is written exactly once below, so the output does not
+    // need a separate zeroing pass.
     for start_token in (0..n_tokens).step_by(MATMUL_TILE_TOKENS) {
         let tile = (n_tokens - start_token).min(MATMUL_TILE_TOKENS);
         for row in 0..rows {
