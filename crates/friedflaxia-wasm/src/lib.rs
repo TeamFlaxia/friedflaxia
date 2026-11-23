@@ -534,11 +534,7 @@ impl Model {
                 top_k as usize,
             )
             .map_err(js_error)?;
-        let k = if out.positions.is_empty() {
-            0
-        } else {
-            out.token_ids.len() / out.positions.len()
-        };
+        let k = out.top_k;
         let positions: Vec<u32> = out.positions.iter().map(|value| *value as u32).collect();
         let object = js_sys::Object::new();
         let position_array = js_sys::Uint32Array::from(positions.as_slice());

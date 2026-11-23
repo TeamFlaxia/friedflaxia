@@ -17,7 +17,7 @@ use crate::gguf::{Gguf, ModelConfig};
 use crate::ops::{rms_norm, rms_norm_batch, rope_neox_inplace, silu};
 use crate::tensor::{TensorView, tensor};
 use std::cmp::{Ordering, Reverse};
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashSet};
 
 /// Architecture string used by Theia's pinned dLLM GGUFs.
 pub const DLLM_ARCHITECTURE: &str = "qwen3-dllm";
@@ -48,10 +48,20 @@ impl DllmConfig {
         let n_head_kv = config
             .u32("attention.head_count_kv")?
             .unwrap_or(n_head as u32) as usize;
-        let head_dim = config
-            .u32("attention.key_length")?
-            .map(|value| value as usize)
-            .unwrap_or_else(|| n_embd / n_head.max(1));
+        let head_dim = match config.u32("attention.key_length")? {
+            Some(value) => value as usize,
+            None => {
+                // Qwen3 has head_dim != n_embd / n_head, so a missing key length
+                // must not silently truncate the head.
+                if n_head == 0 || n_embd % n_head != 0 {
+                    return Err(ModelError::Shape(
+                        "qwen3-dllm needs attention.key_length when n_embd is not divisible by head_count"
+                            .into(),
+                    ));
+                }
+                n_embd / n_head
+            }
+        };
         let eps = config
             .f32("attention.layer_norm_rms_epsilon")?
             .unwrap_or(1e-6);
@@ -63,6 +73,10 @@ impl DllmConfig {
         }
         if n_head == 0 || n_head_kv == 0 || head_dim == 0 || n_head % n_head_kv != 0 {
             return Err(ModelError::Shape("dllm head configuration".into()));
+        }
+        if head_dim % 2 != 0 {
+            // RoPE rotates pairs; an odd head_dim leaves a lane un-rotated.
+            return Err(ModelError::Shape("dllm head_dim must be even".into()));
         }
         let token_embd = gguf
             .tensor("token_embd.weight")
@@ -129,6 +143,8 @@ pub struct DenoiseTopKOutput {
     /// Max softmax probability per position (equal to the first probability).
     pub confidence: Vec<f32>,
     pub vocab_size: usize,
+    /// Effective k after clamping to the vocabulary size.
+    pub top_k: usize,
 }
 
 fn validate_input(
@@ -148,11 +164,15 @@ fn validate_input(
             "block must be a non-empty range inside tokens",
         ));
     }
+    let mut seen = HashSet::with_capacity(positions.len());
     for position in positions {
-        if *position < block.0 || *position >= block.1 {
+        if *position >= block.1 {
             return Err(ModelError::Invalid(
-                "positions must fall inside the active block",
+                "positions must be before the block end (the tail is not computed)",
             ));
+        }
+        if !seen.insert(*position) {
+            return Err(ModelError::Invalid("positions must be unique"));
         }
     }
     if tokens.iter().any(|id| *id as usize >= config.vocab_size) {
@@ -171,27 +191,17 @@ pub fn denoise_step(
 ) -> Result<DenoiseStepOutput, ModelError> {
     let config = DllmConfig::from_gguf(gguf)?;
     validate_input(&config, tokens, positions, block)?;
-    let hidden = forward_hidden(gguf, file, &config, tokens, block)?;
-    let width = config.n_embd;
-    let output_norm = tensor(gguf, file, "output_norm.weight")?.vec()?;
-    if output_norm.len() != width {
-        return Err(ModelError::Shape("output_norm length".into()));
-    }
-    let normed = rms_norm_batch(&hidden, tokens.len(), width, Some(&output_norm), config.eps);
-
-    let mut inputs = Vec::with_capacity(positions.len() * width);
-    for position in positions {
-        let start = position * width;
-        inputs.extend_from_slice(&normed[start..start + width]);
-    }
-    let output = output_tensor(gguf, file, &config)?;
-    let logits = output.matmul(&inputs, positions.len())?;
-    if logits.len() != positions.len() * config.vocab_size {
-        return Err(ModelError::Shape("dllm output projection".into()));
-    }
+    // Tokens at or after block.1 cannot influence a query before block.1 under
+    // the block mask, so the backbone only needs the prefix plus the block.
+    let visible = &tokens[..block.1];
+    let hidden = forward_hidden(gguf, file, &config, visible, block)?;
+    let logits = projected_logits(gguf, file, &config, &hidden, positions)?;
     let confidence = logits
         .chunks_exact(config.vocab_size)
-        .map(confidence_from_logits)
+        .map(|row| {
+            let (_, sum) = softmax_stats(row);
+            if sum > 0.0 { 1.0 / sum } else { 0.0 }
+        })
         .collect();
 
     Ok(DenoiseStepOutput {
@@ -218,21 +228,27 @@ pub fn denoise_topk(
     if top_k == 0 {
         return Err(ModelError::Invalid("top_k must be at least 1"));
     }
-    let step = denoise_step(gguf, file, tokens, positions, block)?;
-    let vocab_size = step.vocab_size;
+    let config = DllmConfig::from_gguf(gguf)?;
+    validate_input(&config, tokens, positions, block)?;
+    let visible = &tokens[..block.1];
+    let hidden = forward_hidden(gguf, file, &config, visible, block)?;
+    // Keep all requested positions in one output projection. The output matrix
+    // is the largest tensor in a 4B model, so chunking by position would stream
+    // it p/chunk times; p is bounded by the caller's block size.
+    let logits = projected_logits(gguf, file, &config, &hidden, positions)?;
+    let vocab_size = config.vocab_size;
     let k = top_k.min(vocab_size);
     let mut token_ids = Vec::with_capacity(positions.len() * k);
     let mut probabilities = Vec::with_capacity(positions.len() * k);
+    let mut confidence = Vec::with_capacity(positions.len());
 
-    for row_index in 0..positions.len() {
-        let row = &step.logits[row_index * vocab_size..(row_index + 1) * vocab_size];
-        let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let sum: f32 = row.iter().map(|value| (value - max).exp()).sum();
-        let top = top_k_indices(row, k);
-        for index in top {
+    for row in logits.chunks_exact(vocab_size) {
+        let (max, sum) = softmax_stats(row);
+        confidence.push(if sum > 0.0 { 1.0 / sum } else { 0.0 });
+        for index in top_k_indices(row, k) {
             token_ids.push(index as u32);
             probabilities.push(if sum > 0.0 {
-                (row[index] - max).exp() / sum
+                (score(row, index) - max).exp() / sum
             } else {
                 0.0
             });
@@ -240,12 +256,45 @@ pub fn denoise_topk(
     }
 
     Ok(DenoiseTopKOutput {
-        positions: step.positions,
+        positions: positions.to_vec(),
         token_ids,
         probabilities,
-        confidence: step.confidence,
+        confidence,
         vocab_size,
+        top_k: k,
     })
+}
+
+fn projected_logits(
+    gguf: &Gguf,
+    file: &[u8],
+    config: &DllmConfig,
+    hidden: &[f32],
+    positions: &[usize],
+) -> Result<Vec<f32>, ModelError> {
+    let width = config.n_embd;
+    let output_norm = tensor(gguf, file, "output_norm.weight")?.vec()?;
+    if output_norm.len() != width {
+        return Err(ModelError::Shape("output_norm length".into()));
+    }
+    let mut selected = Vec::with_capacity(positions.len() * width);
+    for position in positions {
+        let start = position * width;
+        selected.extend_from_slice(&hidden[start..start + width]);
+    }
+    let normed = rms_norm_batch(
+        &selected,
+        positions.len(),
+        width,
+        Some(&output_norm),
+        config.eps,
+    );
+    let output = output_tensor(gguf, file, config)?;
+    let logits = output.matmul(&normed, positions.len())?;
+    if logits.len() != positions.len() * config.vocab_size {
+        return Err(ModelError::Shape("dllm output projection".into()));
+    }
+    Ok(logits)
 }
 
 fn output_tensor<'a>(
@@ -285,6 +334,8 @@ fn forward_hidden(
     for token in tokens {
         hidden.extend_from_slice(&token_embd.row_vec(*token as usize)?);
     }
+    let mut concat = vec![0.0f32; n * q_dim];
+    let mut activated = vec![0.0f32; n * config.n_ff];
 
     for layer in 0..config.n_layer {
         let prefix = format!("blk.{layer}");
@@ -374,7 +425,7 @@ fn forward_hidden(
         }
 
         let scale = 1.0 / (config.head_dim as f32).sqrt();
-        let mut concat = vec![0.0f32; n * q_dim];
+        concat.fill(0.0);
         let mut scores: Vec<f32> = Vec::new();
         for query in 0..n {
             // The active block is bidirectional; everything else is causal.
@@ -391,7 +442,7 @@ fn forward_hidden(
                 scores.extend((0..key_end).map(|other| {
                     let key = &k[other * kv_dim + kv_head * config.head_dim
                         ..other * kv_dim + (kv_head + 1) * config.head_dim];
-                    q_head.iter().zip(key).map(|(q, k)| q * k).sum::<f32>() * scale
+                    crate::simd::dot(q_head, key) * scale
                 }));
                 crate::ops::softmax_in_place(&mut scores);
                 let out = &mut concat[query * q_dim + head * config.head_dim
@@ -417,11 +468,9 @@ fn forward_hidden(
         let ffn_in = rms_norm_batch(&hidden, n, width, Some(&ffn_norm), config.eps);
         let gate = ffn_gate.matmul(&ffn_in, n)?;
         let up = ffn_up.matmul(&ffn_in, n)?;
-        let activated: Vec<f32> = gate
-            .iter()
-            .zip(&up)
-            .map(|(gate, up)| silu(*gate) * up)
-            .collect();
+        for (index, (gate, up)) in gate.iter().zip(&up).enumerate() {
+            activated[index] = silu(*gate) * up;
+        }
         let down = ffn_down.matmul(&activated, n)?;
         if down.len() != hidden.len() {
             return Err(ModelError::Shape(format!("{prefix} ffn output")));
@@ -434,16 +483,35 @@ fn forward_hidden(
     Ok(hidden)
 }
 
-fn confidence_from_logits(row: &[f32]) -> f32 {
-    if row.is_empty() {
-        return 0.0;
+/// Max logit and the softmax denominator. NaN logits are ignored; a row with
+/// no finite value reports a zero denominator (and therefore zero confidence).
+fn softmax_stats(row: &[f32]) -> (f32, f32) {
+    let mut max = f32::NEG_INFINITY;
+    for value in row {
+        if value.is_finite() && *value > max {
+            max = *value;
+        }
     }
-    let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     if !max.is_finite() {
-        return 0.0;
+        return (f32::NEG_INFINITY, 0.0);
     }
-    let sum: f32 = row.iter().map(|value| (value - max).exp()).sum();
-    if sum > 0.0 { 1.0 / sum } else { 0.0 }
+    let mut sum = 0.0f32;
+    for value in row {
+        if value.is_finite() {
+            sum += (value - max).exp();
+        }
+    }
+    (max, sum)
+}
+
+/// A NaN logit must never outrank a real candidate.
+fn score(row: &[f32], index: usize) -> f32 {
+    let value = row[index];
+    if value.is_nan() {
+        f32::NEG_INFINITY
+    } else {
+        value
+    }
 }
 
 /// Indices of the `k` largest values, descending. Ties break by index.
@@ -456,8 +524,11 @@ fn top_k_indices(row: &[f32], k: usize) -> Vec<usize> {
     // Reverse turns BinaryHeap into a min-heap over quality: the worst of the
     // k kept candidates sits at the top and is the one we evict.
     let mut heap: BinaryHeap<Reverse<HeapEntry>> = BinaryHeap::with_capacity(k);
-    for (index, score) in row.iter().copied().enumerate() {
-        let entry = HeapEntry { score, index };
+    for index in 0..row.len() {
+        let entry = HeapEntry {
+            score: score(row, index),
+            index,
+        };
         if heap.len() < k {
             heap.push(Reverse(entry));
         } else if let Some(Reverse(worst)) = heap.peek() {
@@ -473,8 +544,8 @@ fn top_k_indices(row: &[f32], k: usize) -> Vec<usize> {
 }
 
 fn compare_scores(row: &[f32], a: usize, b: usize) -> Ordering {
-    row[b]
-        .partial_cmp(&row[a])
+    score(row, b)
+        .partial_cmp(&score(row, a))
         .unwrap_or(Ordering::Equal)
         .then_with(|| a.cmp(&b))
 }
@@ -511,7 +582,7 @@ impl Ord for HeapEntry {
 
 #[cfg(test)]
 mod tests {
-    use super::{confidence_from_logits, top_k_indices};
+    use super::{softmax_stats, top_k_indices};
 
     #[test]
     fn top_k_orders_by_score_then_index() {
@@ -522,12 +593,20 @@ mod tests {
     }
 
     #[test]
+    fn nan_scores_never_outrank_real_candidates() {
+        let row = [f32::NAN, 0.1, f32::NAN, 0.2];
+        assert_eq!(top_k_indices(&row, 1), vec![3]);
+        assert_eq!(top_k_indices(&row, 4)[..2], [3, 1]);
+    }
+
+    #[test]
     fn confidence_is_the_max_softmax_probability() {
-        let confidence = confidence_from_logits(&[0.0, 0.0, 0.0, 0.0]);
-        assert!((confidence - 0.25).abs() < 1e-6);
-        let peaked = confidence_from_logits(&[0.0, 10.0]);
-        assert!(peaked > 0.999);
-        assert_eq!(confidence_from_logits(&[]), 0.0);
-        assert_eq!(confidence_from_logits(&[f32::NEG_INFINITY]), 0.0);
+        let (_, sum) = softmax_stats(&[0.0, 0.0, 0.0, 0.0]);
+        assert!((1.0 / sum - 0.25).abs() < 1e-6);
+        let (_, sum) = softmax_stats(&[0.0, 10.0]);
+        assert!(1.0 / sum > 0.999);
+        assert_eq!(softmax_stats(&[]).1, 0.0);
+        assert_eq!(softmax_stats(&[f32::NEG_INFINITY]).1, 0.0);
+        assert_eq!(softmax_stats(&[f32::NAN]).1, 0.0);
     }
 }
