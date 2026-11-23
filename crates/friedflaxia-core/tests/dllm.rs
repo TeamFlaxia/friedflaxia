@@ -1,5 +1,8 @@
 use friedflaxia_core::gguf::{Gguf, TensorType};
-use friedflaxia_core::models::dllm::{denoise_step, denoise_topk};
+use friedflaxia_core::models::dllm::{
+    denoise_step, denoise_step_with_lora, denoise_topk, denoise_topk_with_lora,
+};
+use friedflaxia_core::models::lora::LoraModel;
 
 const ALIGNMENT: usize = 32;
 const GGUF_VERSION: u32 = 3;
@@ -233,7 +236,10 @@ fn build_gguf_with_key_length(
     );
     put_kv_f32(&mut metadata, "qwen3-dllm.rope.freq_base", 10_000.0);
     let metadata_count = if key_length.is_some() { 10u64 } else { 9u64 };
+    write_gguf(specs, metadata, metadata_count)
+}
 
+fn write_gguf(specs: Vec<TensorSpec>, metadata: Vec<u8>, metadata_count: u64) -> Vec<u8> {
     let mut offsets = Vec::with_capacity(specs.len());
     let mut cursor = 0usize;
     for spec in &specs {
@@ -267,6 +273,29 @@ fn build_gguf_with_key_length(
         }
     }
     out
+}
+
+/// One-layer adapter on the simple model's attn_q projection.
+fn build_lora(rank: usize, tensor_rank: usize, alpha: f32, zero_b: bool, only_a: bool) -> Vec<u8> {
+    let mut metadata = Vec::new();
+    put_kv_u32(&mut metadata, "general.alignment", ALIGNMENT as u32);
+    put_kv_string(&mut metadata, "general.architecture", "qwen3-dllm-lora");
+    put_kv_u32(&mut metadata, "qwen3-dllm-lora.rank", rank as u32);
+    put_kv_f32(&mut metadata, "qwen3-dllm-lora.alpha", alpha);
+    let mut specs = vec![matrix("blk.0.attn_q.lora_a.weight", 8, tensor_rank, 21)];
+    if !only_a {
+        let mut b = matrix("blk.0.attn_q.lora_b.weight", tensor_rank, 8, 22);
+        if zero_b {
+            b.values.fill(0.0);
+        }
+        specs.push(b);
+    }
+    write_gguf(specs, metadata, 4)
+}
+
+fn lora_from(bytes: Vec<u8>) -> LoraModel {
+    let gguf = Gguf::parse(&bytes).expect("parse lora");
+    LoraModel::from_gguf(gguf, bytes, 1).expect("load lora")
 }
 
 fn build_model(tie_output: bool) -> Vec<u8> {
@@ -444,6 +473,65 @@ fn scoring_a_prefix_position_is_allowed() {
     let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
     let out = denoise_step(&gguf, &bytes, &[1, 2, 3, 4], &[0], (2, 4)).expect("prefix score");
     assert_eq!(out.logits.len(), 5);
+}
+
+#[test]
+fn zero_lora_matches_the_base_model() {
+    let bytes = build_model(false);
+    let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
+    let tokens = [1, 2, 3, 4];
+    let positions = [2, 3];
+    let base = denoise_step(&gguf, &bytes, &tokens, &positions, (2, 4)).expect("base");
+    let lora = lora_from(build_lora(2, 2, 4.0, true, false));
+    assert_eq!(lora.rank(), 2);
+    assert!((lora.scale() - 2.0).abs() < 1e-6);
+    let adapted = denoise_step_with_lora(&gguf, &bytes, &tokens, &positions, (2, 4), Some(&lora))
+        .expect("lora");
+    assert_close(&base.logits, &adapted.logits);
+}
+
+#[test]
+fn nonzero_lora_changes_logits() {
+    let bytes = build_model(false);
+    let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
+    let tokens = [1, 2, 3, 4];
+    let positions = [2, 3];
+    let base = denoise_step(&gguf, &bytes, &tokens, &positions, (2, 4)).expect("base");
+    let lora = lora_from(build_lora(2, 2, 4.0, false, false));
+    let adapted = denoise_step_with_lora(&gguf, &bytes, &tokens, &positions, (2, 4), Some(&lora))
+        .expect("lora");
+    assert_ne!(base.logits, adapted.logits);
+    assert!(adapted.logits.iter().all(|value| value.is_finite()));
+}
+
+#[test]
+fn zero_lora_topk_matches_the_base() {
+    let bytes = build_model(false);
+    let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
+    let tokens = [1, 2, 3, 4];
+    let positions = [2, 3];
+    let base = denoise_topk(&gguf, &bytes, &tokens, &positions, (2, 4), 2).expect("base");
+    let lora = lora_from(build_lora(2, 2, 4.0, true, false));
+    let adapted =
+        denoise_topk_with_lora(&gguf, &bytes, &tokens, &positions, (2, 4), 2, Some(&lora))
+            .expect("lora");
+    assert_eq!(base.token_ids, adapted.token_ids);
+    assert_close(&base.probabilities, &adapted.probabilities);
+}
+
+#[test]
+fn lora_rejects_half_a_pair_and_bad_shapes() {
+    let bytes = build_lora(2, 2, 4.0, false, true);
+    let gguf = Gguf::parse(&bytes).expect("parse half lora");
+    assert!(LoraModel::from_gguf(gguf, bytes, 1).is_err());
+
+    let base = build_model(false);
+    let gguf = Gguf::parse(&base).expect("parse tiny dLLM");
+    // Metadata rank 2 but the tensors have rank 3.
+    let lora = lora_from(build_lora(2, 3, 4.0, false, false));
+    let error = denoise_step_with_lora(&gguf, &base, &[1, 2, 3, 4], &[2, 3], (2, 4), Some(&lora))
+        .unwrap_err();
+    assert!(error.to_string().contains("A shape"), "{error}");
 }
 
 #[test]
