@@ -79,9 +79,14 @@ def quantize_q4_0(rows: np.ndarray) -> bytes:
     if rows.shape[1] % QK != 0:
         raise SystemExit(f"Q4_0 needs cols%32==0, got {rows.shape}")
     blocks = rows.reshape(rows.shape[0], -1, QK)
-    amax = np.max(np.abs(blocks), axis=2)
-    scale = np.where(amax > 0, amax / 8.0, 1.0).astype(np.float32)
-    quant = np.rint(blocks / scale[:, :, None]) + 8.0
+    # ggml uses a signed scale derived from the extreme element: d = ext / -8.
+    # A positive amax/8 scale would clip every positive extreme to 15 and lose
+    # one quantum of accuracy in half the blocks.
+    extreme_index = np.argmax(np.abs(blocks), axis=2)
+    extreme = np.take_along_axis(blocks, extreme_index[:, :, None], axis=2)[:, :, 0]
+    scale = np.where(extreme != 0, extreme / -8.0, 0.0).astype(np.float32)
+    divisor = np.where(scale != 0, scale, 1.0)
+    quant = np.floor(blocks / divisor[:, :, None] + 8.5)
     quant = np.clip(quant, 0, 15).astype(np.uint8)
     low = quant[:, :, : QK // 2]
     high = quant[:, :, QK // 2 :]

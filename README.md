@@ -38,7 +38,7 @@ Implemented and tested:
 - Q4_0, Q4_1, Q6_K, Q8_0 and BF16 dequantization, plus F16 scale decoding
 - Quantized matrix-vector kernels for Q4_0/Q4_1/Q6_K/Q8_0/F32/BF16
 - GGUF tokenizer metadata and tokenizers:
-  - BPE for `gpt2` (d1-omni) and `gemma4` (EmbeddingGemma 2)
+  - BPE for `gpt2` (d1-omni), `gemma4` (EmbeddingGemma 2) and `qwen3` (dLLM)
   - Unigram for `plamo3` (PLaMO 3 Translate)
 - Architecture-scoped configuration reader
 - Tensor views with quantized row access
