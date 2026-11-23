@@ -8,6 +8,10 @@ use friedflaxia_core::gguf::{Gguf, ParseOptions};
 use friedflaxia_core::models::d1_audio::encode_audio as encode_d1_audio;
 use friedflaxia_core::models::d1_vision::encode_image as encode_d1_image;
 use friedflaxia_core::models::d1omni::{decision_logits, decision_logits_with_prefix};
+use friedflaxia_core::models::dllm::{
+    DenoiseStepOutput, DenoiseTopKOutput, denoise_step as dllm_denoise_step,
+    denoise_topk as dllm_denoise_topk,
+};
 use friedflaxia_core::models::embeddinggemma::{embed_text, embed_text_with_features};
 use friedflaxia_core::models::gemma_audio::encode_audio;
 use friedflaxia_core::models::gemma_vision::encode_image;
@@ -102,6 +106,7 @@ enum ModelKind {
     D1Omni,
     Plamo3,
     NudeNet,
+    Dllm,
 }
 
 impl ModelKind {
@@ -111,6 +116,7 @@ impl ModelKind {
             "lfm2" => Some(Self::D1Omni),
             "plamo3" => Some(Self::Plamo3),
             "yolov8-nudenet" => Some(Self::NudeNet),
+            "qwen3-dllm" => Some(Self::Dllm),
             _ => None,
         }
     }
@@ -250,6 +256,35 @@ impl Engine {
             return Err(EngineError::new("model is not plamo3"));
         }
         next_token(&self.gguf, &self.bytes, token_ids)
+            .map_err(|error| EngineError::new(error.to_string()))
+    }
+
+    /// One masked-diffusion denoising step returning full per-position logits.
+    pub fn denoise_step(
+        &self,
+        tokens: &[u32],
+        positions: &[usize],
+        block: (usize, usize),
+    ) -> Result<DenoiseStepOutput, EngineError> {
+        if self.kind != ModelKind::Dllm {
+            return Err(EngineError::new("model is not qwen3-dllm"));
+        }
+        dllm_denoise_step(&self.gguf, &self.bytes, tokens, positions, block)
+            .map_err(|error| EngineError::new(error.to_string()))
+    }
+
+    /// One denoising step returning the top-k candidates per position.
+    pub fn denoise_topk(
+        &self,
+        tokens: &[u32],
+        positions: &[usize],
+        block: (usize, usize),
+        top_k: usize,
+    ) -> Result<DenoiseTopKOutput, EngineError> {
+        if self.kind != ModelKind::Dllm {
+            return Err(EngineError::new("model is not qwen3-dllm"));
+        }
+        dllm_denoise_topk(&self.gguf, &self.bytes, tokens, positions, block, top_k)
             .map_err(|error| EngineError::new(error.to_string()))
     }
 
@@ -426,6 +461,121 @@ impl Model {
 
     pub fn next_token(&self, token_ids: &[u32]) -> Result<u32, JsValue> {
         self.engine.next_token(token_ids).map_err(js_error)
+    }
+
+    /// Full-vocabulary logits for the requested positions of one denoise step.
+    ///
+    /// Returns `{ logits: Float32Array, positions: Uint32Array, confidence:
+    /// Float32Array, vocabSize: number }`. `logits` is row-major
+    /// `[positions.len()][vocabSize]`.
+    pub fn denoise_step(
+        &self,
+        tokens: &[u32],
+        positions: &[u32],
+        block_start: u32,
+        block_end: u32,
+    ) -> Result<JsValue, JsValue> {
+        let positions_usize: Vec<usize> = positions.iter().map(|value| *value as usize).collect();
+        let out = self
+            .engine
+            .denoise_step(
+                tokens,
+                &positions_usize,
+                (block_start as usize, block_end as usize),
+            )
+            .map_err(js_error)?;
+        let object = js_sys::Object::new();
+        let logits = js_sys::Float32Array::from(out.logits.as_slice());
+        let confidence = js_sys::Float32Array::from(out.confidence.as_slice());
+        let positions = js_sys::Uint32Array::from(positions);
+        js_sys::Reflect::set(
+            &object,
+            &JsValue::from_str("logits"),
+            &JsValue::from(logits),
+        )?;
+        js_sys::Reflect::set(
+            &object,
+            &JsValue::from_str("confidence"),
+            &JsValue::from(confidence),
+        )?;
+        js_sys::Reflect::set(
+            &object,
+            &JsValue::from_str("positions"),
+            &JsValue::from(positions),
+        )?;
+        js_sys::Reflect::set(
+            &object,
+            &JsValue::from_str("vocabSize"),
+            &JsValue::from_f64(out.vocab_size as f64),
+        )?;
+        Ok(object.into())
+    }
+
+    /// Top-k candidates for the requested positions of one denoise step.
+    ///
+    /// Returns `{ positions, tokenIds, probabilities, confidence, vocabSize,
+    /// topK }`. `tokenIds`/`probabilities` are row-major
+    /// `[positions.len()][topK]`.
+    pub fn denoise_topk(
+        &self,
+        tokens: &[u32],
+        positions: &[u32],
+        block_start: u32,
+        block_end: u32,
+        top_k: u32,
+    ) -> Result<JsValue, JsValue> {
+        let positions_usize: Vec<usize> = positions.iter().map(|value| *value as usize).collect();
+        let out = self
+            .engine
+            .denoise_topk(
+                tokens,
+                &positions_usize,
+                (block_start as usize, block_end as usize),
+                top_k as usize,
+            )
+            .map_err(js_error)?;
+        let k = if out.positions.is_empty() {
+            0
+        } else {
+            out.token_ids.len() / out.positions.len()
+        };
+        let positions: Vec<u32> = out.positions.iter().map(|value| *value as u32).collect();
+        let object = js_sys::Object::new();
+        let position_array = js_sys::Uint32Array::from(positions.as_slice());
+        let token_array = js_sys::Uint32Array::from(out.token_ids.as_slice());
+        let probabilities = js_sys::Float32Array::from(out.probabilities.as_slice());
+        let confidence = js_sys::Float32Array::from(out.confidence.as_slice());
+        js_sys::Reflect::set(
+            &object,
+            &JsValue::from_str("positions"),
+            &JsValue::from(position_array),
+        )?;
+        js_sys::Reflect::set(
+            &object,
+            &JsValue::from_str("tokenIds"),
+            &JsValue::from(token_array),
+        )?;
+        js_sys::Reflect::set(
+            &object,
+            &JsValue::from_str("probabilities"),
+            &JsValue::from(probabilities),
+        )?;
+        js_sys::Reflect::set(
+            &object,
+            &JsValue::from_str("confidence"),
+            &JsValue::from(confidence),
+        )?;
+        js_sys::Reflect::set(
+            &object,
+            &JsValue::from_str("vocabSize"),
+            &JsValue::from_f64(out.vocab_size as f64),
+        )?;
+        js_sys::Reflect::set(
+            &object,
+            &JsValue::from_str("topK"),
+            &JsValue::from_f64(k as f64),
+        )?;
+        Ok(object.into())
     }
 
     pub fn token_id(&self, token: &str) -> Option<u32> {
