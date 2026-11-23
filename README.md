@@ -84,11 +84,26 @@ forward parity jobs.
 Additionally:
 
 - PLaMO KV cache (`PlamoSession`) with prefill + single-token decode
+- Batched Q4_0/Q8_0 matmul kernels (`quant::matmul_*`) and batched encoder /
+  prefill passes
 - wasm-bindgen package (`friedflaxia-wasm`) with `Model`, `MultimodalModel`
   and `D1MultimodalModel`
 - Node smoke test against the real Q8_0 model
 - Crowd uses FriedFlaxia for embed-gemma, vector-embed (text/image/audio),
   d1 decisions (text/image/audio), PLaMO translation and NudeNet 320n.
+
+## Batching
+
+`quant::matmul_q4_0` / `matmul_q8_0` dequantize each weight block once and reuse
+it across a tile of tokens. EmbeddingGemma's encoder and PLaMO's prefill now go
+through those kernels, so the weight matrix is streamed once per layer instead of
+once per token. Single-token decode still uses the per-token kernels, so decode
+numbers are unchanged. The ignored test
+`embeddinggemma_batched_long_sequence_timing` prints the per-token cost for
+9/64/256 tokens.
+
+Flaxia Crowd caps one encoder sequence at 2048 tokens
+(`MAX_EMBED_GEMMA_TOKENS`); longer input is truncated with BOS/EOS preserved.
 
 Next slices:
 
