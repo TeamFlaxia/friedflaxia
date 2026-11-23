@@ -187,6 +187,14 @@ fn model_specs(dims: ModelDims, tie_output: bool, uniform_norms: bool) -> Vec<Te
 }
 
 fn build_gguf(specs: Vec<TensorSpec>, dims: ModelDims) -> Vec<u8> {
+    build_gguf_with_key_length(specs, dims, Some(dims.head_dim))
+}
+
+fn build_gguf_with_key_length(
+    specs: Vec<TensorSpec>,
+    dims: ModelDims,
+    key_length: Option<usize>,
+) -> Vec<u8> {
     let mut metadata = Vec::new();
     put_kv_u32(&mut metadata, "general.alignment", ALIGNMENT as u32);
     put_kv_string(&mut metadata, "general.architecture", "qwen3-dllm");
@@ -211,18 +219,20 @@ fn build_gguf(specs: Vec<TensorSpec>, dims: ModelDims) -> Vec<u8> {
         "qwen3-dllm.attention.head_count_kv",
         dims.n_head_kv as u32,
     );
-    put_kv_u32(
-        &mut metadata,
-        "qwen3-dllm.attention.key_length",
-        dims.head_dim as u32,
-    );
+    if let Some(key_length) = key_length {
+        put_kv_u32(
+            &mut metadata,
+            "qwen3-dllm.attention.key_length",
+            key_length as u32,
+        );
+    }
     put_kv_f32(
         &mut metadata,
         "qwen3-dllm.attention.layer_norm_rms_epsilon",
         1e-6,
     );
     put_kv_f32(&mut metadata, "qwen3-dllm.rope.freq_base", 10_000.0);
-    let metadata_count = 10u64;
+    let metadata_count = if key_length.is_some() { 10u64 } else { 9u64 };
 
     let mut offsets = Vec::with_capacity(specs.len());
     let mut cursor = 0usize;
@@ -461,6 +471,38 @@ fn fixture_tensors_are_f32() {
         gguf.tensor("blk.0.attn_q.weight").unwrap().tensor_type,
         TensorType::F32
     );
+}
+
+#[test]
+fn rejects_odd_head_dim() {
+    let dims = ModelDims {
+        n_layer: 1,
+        n_embd: 6,
+        n_ff: 12,
+        n_head: 2,
+        n_head_kv: 1,
+        head_dim: 3,
+    };
+    let bytes = build_gguf(model_specs(dims, false, true), dims);
+    let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
+    let error = denoise_step(&gguf, &bytes, &[1, 2], &[0], (0, 2)).unwrap_err();
+    assert!(error.to_string().contains("head_dim"), "{error}");
+}
+
+#[test]
+fn rejects_missing_key_length_when_not_divisible() {
+    let dims = ModelDims {
+        n_layer: 1,
+        n_embd: 7,
+        n_ff: 14,
+        n_head: 2,
+        n_head_kv: 1,
+        head_dim: 4,
+    };
+    let bytes = build_gguf_with_key_length(model_specs(dims, false, true), dims, None);
+    let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
+    let error = denoise_step(&gguf, &bytes, &[1, 2], &[0], (0, 2)).unwrap_err();
+    assert!(error.to_string().contains("key_length"), "{error}");
 }
 
 #[test]
