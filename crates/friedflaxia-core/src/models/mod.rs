@@ -3,6 +3,7 @@
 pub mod d1_audio;
 pub mod d1_vision;
 pub mod d1omni;
+pub mod dllm;
 pub mod embeddinggemma;
 pub mod gemma_audio;
 pub mod gemma_vision;
