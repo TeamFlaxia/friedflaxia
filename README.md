@@ -87,7 +87,7 @@ Additionally:
 - Batched Q4_0/Q8_0 matmul kernels (`quant::matmul_*`) and batched encoder /
   prefill passes
 - `qwen3-dllm` masked-diffusion denoise step (block attention mask, full logits
-  or top-k candidates, wasm bindings)
+  or top-k candidates, LoRA adapters, wasm bindings)
 - wasm-bindgen package (`friedflaxia-wasm`) with `Model`, `MultimodalModel`
   and `D1MultimodalModel`
 - Node smoke test against the real Q8_0 model

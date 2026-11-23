@@ -5,7 +5,7 @@ nodes and merges their per-position token distributions. This note records the
 implemented FriedFlaxia extension and what is still missing.
 
 > Status: the qwen3-dllm forward pass, block attention mask, full-logit and
-> top-k APIs, and the wasm bindings are implemented. LoRA adapters, a block/KV
+> top-k APIs, LoRA adapters and the wasm bindings are implemented. A block/KV
 > cache and real-model parity are next.
 
 ## Implemented
@@ -41,12 +41,38 @@ model.denoise_topk(tokens, positions, blockStart, blockEnd, topK)
 // { positions: Uint32Array, tokenIds: Uint32Array,
 //   probabilities: Float32Array, confidence: Float32Array,
 //   vocabSize: number, topK: number }
+
+Model.withLora(baseBytes, loraBytes)   // base dLLM + adapter
+model.loraRank()                       // number | undefined
+model.loraExpert()                     // string | undefined
 ```
 
 `logits` is row-major `[positions.len()][vocabSize]` and is **raw** (apply
 softmax on the host if you need probabilities). `tokenIds` and `probabilities`
 are row-major `[positions.len()][topK]`; `probabilities` are already softmaxed,
 so `confidence` equals the first probability of each row.
+
+## LoRA adapters
+
+Theia's v1 experts are LoRA adapters over one base dLLM. An adapter is a
+separate `qwen3-dllm-lora` GGUF:
+
+```text
+general.architecture      = "qwen3-dllm-lora"
+qwen3-dllm-lora.rank      = 16
+qwen3-dllm-lora.alpha     = 32.0     (optional, defaults to rank)
+qwen3-dllm-lora.expert    = "code"   (optional)
+
+blk.{i}.attn_q.lora_a.weight      [in, rank]
+blk.{i}.attn_q.lora_b.weight      [rank, out]
+... attn_k, attn_v, attn_output, ffn_gate, ffn_up, ffn_down
+```
+
+Each projection becomes `W x + (alpha / rank) * B (A x)`. Modules without
+tensors are left untouched; a module with only one of `lora_a`/`lora_b` is
+rejected. A zero `lora_b` is a verified no-op. `Model.withLora` loads the adapter
+next to the base model, and `loraRank`/`loraExpert` expose its identity for node
+reporting and delta attribution.
 
 ## Still missing
 
@@ -56,13 +82,11 @@ so `confidence` equals the first probability of each row.
    win.
 2. **A session handle.** Config, tensor lookups and norm tensors are re-read on
    every call. A `DllmSession` is also the natural home for the KV cache.
-3. **LoRA adapters.** Theia's v1 experts are LoRA adapters on one base model;
-   the engine does not apply adapters yet.
-4. **SDAR self-conditioning.** QwenDLM's residual adapter is not implemented;
+3. **SDAR self-conditioning.** QwenDLM's residual adapter is not implemented;
    the base Qwen3 forward is.
-5. **Real-model parity.** The synthetic tiny GGUFs cover the mask and API; a
+4. **Real-model parity.** The synthetic tiny GGUFs cover the mask and API; a
    pinned QwenDLM/Qwen3-0.6B-bd3lm comparison is still required.
-6. **Sampling and ensemble.** The host owns sampling, Self-Repulsion and delta
+5. **Sampling and ensemble.** The host owns sampling, Self-Repulsion and delta
    merging. Rust only returns scores.
 
 ## Tests
