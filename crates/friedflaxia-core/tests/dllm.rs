@@ -46,61 +46,176 @@ fn pseudo_weights(count: usize, seed: u64) -> Vec<f32> {
 }
 
 struct TensorSpec {
-    name: &'static str,
+    name: String,
     dims: Vec<u64>,
     values: Vec<f32>,
 }
 
-fn matrix(name: &'static str, cols: usize, rows: usize, seed: u64) -> TensorSpec {
+fn matrix(name: &str, cols: usize, rows: usize, seed: u64) -> TensorSpec {
     TensorSpec {
-        name,
+        name: name.to_string(),
         dims: vec![cols as u64, rows as u64],
         values: pseudo_weights(cols * rows, seed),
     }
 }
 
-fn vector(name: &'static str, len: usize) -> TensorSpec {
+fn vector(name: &str, len: usize, uniform: bool) -> TensorSpec {
     TensorSpec {
-        name,
+        name: name.to_string(),
         dims: vec![len as u64],
-        values: vec![1.0; len],
+        values: if uniform {
+            vec![1.0; len]
+        } else {
+            (0..len).map(|index| 0.55 + 0.07 * index as f32).collect()
+        },
     }
 }
 
-/// Tiny Qwen3-style dLLM: one layer, 8-d hidden, 2 query heads, 1 KV head.
-fn model_specs(tie_output: bool) -> Vec<TensorSpec> {
-    let mut specs = vec![
-        matrix("token_embd.weight", 8, 5, 1),
-        vector("blk.0.attn_norm.weight", 8),
-        matrix("blk.0.attn_q.weight", 8, 8, 2),
-        matrix("blk.0.attn_k.weight", 8, 4, 3),
-        matrix("blk.0.attn_v.weight", 8, 4, 4),
-        vector("blk.0.attn_q_norm.weight", 4),
-        vector("blk.0.attn_k_norm.weight", 4),
-        matrix("blk.0.attn_output.weight", 8, 8, 5),
-        vector("blk.0.ffn_norm.weight", 8),
-        matrix("blk.0.ffn_gate.weight", 8, 16, 6),
-        matrix("blk.0.ffn_up.weight", 8, 16, 7),
-        matrix("blk.0.ffn_down.weight", 16, 8, 8),
-        vector("output_norm.weight", 8),
-    ];
+#[derive(Clone, Copy)]
+struct ModelDims {
+    n_layer: usize,
+    n_embd: usize,
+    n_ff: usize,
+    n_head: usize,
+    n_head_kv: usize,
+    head_dim: usize,
+}
+
+impl ModelDims {
+    /// One layer, 8-d hidden, 2 query heads, 1 KV head.
+    const SIMPLE: Self = Self {
+        n_layer: 1,
+        n_embd: 8,
+        n_ff: 16,
+        n_head: 2,
+        n_head_kv: 1,
+        head_dim: 4,
+    };
+    /// Two layers, 16-d hidden, 4 query heads / 2 KV heads, non-uniform norms.
+    /// This shape catches GQA mapping, multi-layer residuals and norm/RoPE order.
+    const HARDENED: Self = Self {
+        n_layer: 2,
+        n_embd: 16,
+        n_ff: 32,
+        n_head: 4,
+        n_head_kv: 2,
+        head_dim: 4,
+    };
+
+    fn q_dim(&self) -> usize {
+        self.n_head * self.head_dim
+    }
+
+    fn kv_dim(&self) -> usize {
+        self.n_head_kv * self.head_dim
+    }
+}
+
+fn model_specs(dims: ModelDims, tie_output: bool, uniform_norms: bool) -> Vec<TensorSpec> {
+    let mut specs = vec![matrix("token_embd.weight", dims.n_embd, 5, 1)];
+    for layer in 0..dims.n_layer {
+        let p = format!("blk.{layer}");
+        let seed = 100 * (layer as u64 + 1);
+        specs.push(vector(
+            &format!("{p}.attn_norm.weight"),
+            dims.n_embd,
+            uniform_norms,
+        ));
+        specs.push(matrix(
+            &format!("{p}.attn_q.weight"),
+            dims.n_embd,
+            dims.q_dim(),
+            seed + 1,
+        ));
+        specs.push(matrix(
+            &format!("{p}.attn_k.weight"),
+            dims.n_embd,
+            dims.kv_dim(),
+            seed + 2,
+        ));
+        specs.push(matrix(
+            &format!("{p}.attn_v.weight"),
+            dims.n_embd,
+            dims.kv_dim(),
+            seed + 3,
+        ));
+        specs.push(matrix(
+            &format!("{p}.attn_output.weight"),
+            dims.q_dim(),
+            dims.n_embd,
+            seed + 4,
+        ));
+        specs.push(vector(
+            &format!("{p}.attn_q_norm.weight"),
+            dims.head_dim,
+            uniform_norms,
+        ));
+        specs.push(vector(
+            &format!("{p}.attn_k_norm.weight"),
+            dims.head_dim,
+            uniform_norms,
+        ));
+        specs.push(vector(
+            &format!("{p}.ffn_norm.weight"),
+            dims.n_embd,
+            uniform_norms,
+        ));
+        specs.push(matrix(
+            &format!("{p}.ffn_gate.weight"),
+            dims.n_embd,
+            dims.n_ff,
+            seed + 5,
+        ));
+        specs.push(matrix(
+            &format!("{p}.ffn_up.weight"),
+            dims.n_embd,
+            dims.n_ff,
+            seed + 6,
+        ));
+        specs.push(matrix(
+            &format!("{p}.ffn_down.weight"),
+            dims.n_ff,
+            dims.n_embd,
+            seed + 7,
+        ));
+    }
+    specs.push(vector("output_norm.weight", dims.n_embd, uniform_norms));
     if !tie_output {
-        specs.push(matrix("output.weight", 8, 5, 9));
+        specs.push(matrix("output.weight", dims.n_embd, 5, 900));
     }
     specs
 }
 
-fn build_model(tie_output: bool) -> Vec<u8> {
-    let specs = model_specs(tie_output);
+fn build_gguf(specs: Vec<TensorSpec>, dims: ModelDims) -> Vec<u8> {
     let mut metadata = Vec::new();
     put_kv_u32(&mut metadata, "general.alignment", ALIGNMENT as u32);
     put_kv_string(&mut metadata, "general.architecture", "qwen3-dllm");
-    put_kv_u32(&mut metadata, "qwen3-dllm.block_count", 1);
-    put_kv_u32(&mut metadata, "qwen3-dllm.embedding_length", 8);
-    put_kv_u32(&mut metadata, "qwen3-dllm.feed_forward_length", 16);
-    put_kv_u32(&mut metadata, "qwen3-dllm.attention.head_count", 2);
-    put_kv_u32(&mut metadata, "qwen3-dllm.attention.head_count_kv", 1);
-    put_kv_u32(&mut metadata, "qwen3-dllm.attention.key_length", 4);
+    put_kv_u32(&mut metadata, "qwen3-dllm.block_count", dims.n_layer as u32);
+    put_kv_u32(
+        &mut metadata,
+        "qwen3-dllm.embedding_length",
+        dims.n_embd as u32,
+    );
+    put_kv_u32(
+        &mut metadata,
+        "qwen3-dllm.feed_forward_length",
+        dims.n_ff as u32,
+    );
+    put_kv_u32(
+        &mut metadata,
+        "qwen3-dllm.attention.head_count",
+        dims.n_head as u32,
+    );
+    put_kv_u32(
+        &mut metadata,
+        "qwen3-dllm.attention.head_count_kv",
+        dims.n_head_kv as u32,
+    );
+    put_kv_u32(
+        &mut metadata,
+        "qwen3-dllm.attention.key_length",
+        dims.head_dim as u32,
+    );
     put_kv_f32(
         &mut metadata,
         "qwen3-dllm.attention.layer_norm_rms_epsilon",
@@ -124,7 +239,7 @@ fn build_model(tie_output: bool) -> Vec<u8> {
     out.extend_from_slice(&metadata);
 
     for (spec, offset) in specs.iter().zip(&offsets) {
-        put_string(&mut out, spec.name);
+        put_string(&mut out, &spec.name);
         out.extend_from_slice(&(spec.dims.len() as u32).to_le_bytes());
         for dim in &spec.dims {
             out.extend_from_slice(&dim.to_le_bytes());
@@ -142,6 +257,20 @@ fn build_model(tie_output: bool) -> Vec<u8> {
         }
     }
     out
+}
+
+fn build_model(tie_output: bool) -> Vec<u8> {
+    build_gguf(
+        model_specs(ModelDims::SIMPLE, tie_output, true),
+        ModelDims::SIMPLE,
+    )
+}
+
+fn build_hardened_model() -> Vec<u8> {
+    build_gguf(
+        model_specs(ModelDims::HARDENED, false, false),
+        ModelDims::HARDENED,
+    )
 }
 
 fn assert_close(a: &[f32], b: &[f32]) {
@@ -203,6 +332,17 @@ fn block_mask_hides_future_tokens() {
 }
 
 #[test]
+fn block_mask_is_bidirectional_inside_the_block() {
+    let bytes = build_model(false);
+    let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
+    let base = denoise_step(&gguf, &bytes, &[1, 2, 3, 4], &[0], (0, 2)).expect("base");
+    // Query 0 is inside the block, so token 1 (a later block position) must be
+    // visible. A causal-only mask would leave these logits unchanged.
+    let changed = denoise_step(&gguf, &bytes, &[1, 0, 3, 4], &[0], (0, 2)).expect("changed");
+    assert_ne!(base.logits, changed.logits);
+}
+
+#[test]
 fn block_mask_reads_the_clean_prefix() {
     let bytes = build_model(false);
     let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
@@ -220,6 +360,41 @@ fn tied_output_projection_is_supported() {
 }
 
 #[test]
+fn hardened_model_matches_golden_logits() {
+    let bytes = build_hardened_model();
+    let gguf = Gguf::parse(&bytes).expect("parse hardened dLLM");
+    let tokens = [1, 2, 3, 4, 0, 1, 2, 3];
+    let out = denoise_step(&gguf, &bytes, &tokens, &[0, 4, 7], (0, 8)).expect("hardened");
+    assert_eq!(out.positions, vec![0, 4, 7]);
+    assert_eq!(out.logits.len(), 3 * 5);
+    // Regression lock for the block mask, q/k norm -> RoPE order, residual
+    // addition, GQA mapping (4 query / 2 KV heads) and two-layer stacking.
+    const GOLDEN: [f32; 15] = [
+        -0.5107393,
+        -0.2641858,
+        -1.0002869,
+        0.42415598,
+        1.2973803,
+        -0.74567235,
+        -0.18163148,
+        -0.8792292,
+        0.6298983,
+        1.3569688,
+        -0.052192926,
+        -0.10673007,
+        -0.9995232,
+        0.49606305,
+        1.153955,
+    ];
+    for (index, (left, right)) in out.logits.iter().zip(&GOLDEN).enumerate() {
+        assert!(
+            (left - right).abs() < 1e-4,
+            "golden value {index} differs: {left} != {right}"
+        );
+    }
+}
+
+#[test]
 fn top_k_matches_the_full_distribution() {
     let bytes = build_model(false);
     let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
@@ -229,6 +404,7 @@ fn top_k_matches_the_full_distribution() {
     let top = denoise_topk(&gguf, &bytes, &tokens, &positions, (2, 4), 2).expect("top-k");
 
     assert_eq!(top.vocab_size, 5);
+    assert_eq!(top.top_k, 2);
     assert_eq!(top.positions, vec![2, 3]);
     assert_eq!(top.token_ids.len(), 2 * 2);
     assert_eq!(top.probabilities.len(), 2 * 2);
@@ -244,6 +420,23 @@ fn top_k_matches_the_full_distribution() {
 }
 
 #[test]
+fn future_tokens_are_not_read() {
+    let bytes = build_model(false);
+    let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
+    let short = denoise_step(&gguf, &bytes, &[1, 2], &[0, 1], (0, 2)).expect("short");
+    let long = denoise_step(&gguf, &bytes, &[1, 2, 3, 4], &[0, 1], (0, 2)).expect("long");
+    assert_close(&short.logits, &long.logits);
+}
+
+#[test]
+fn scoring_a_prefix_position_is_allowed() {
+    let bytes = build_model(false);
+    let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
+    let out = denoise_step(&gguf, &bytes, &[1, 2, 3, 4], &[0], (2, 4)).expect("prefix score");
+    assert_eq!(out.logits.len(), 5);
+}
+
+#[test]
 fn rejects_invalid_inputs() {
     let bytes = build_model(false);
     let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
@@ -252,9 +445,11 @@ fn rejects_invalid_inputs() {
     assert!(denoise_step(&gguf, &bytes, &[1, 2], &[], (0, 2)).is_err());
     assert!(denoise_step(&gguf, &bytes, &[1, 2], &[0], (2, 4)).is_err());
     assert!(denoise_step(&gguf, &bytes, &[1, 2], &[3], (0, 2)).is_err());
+    assert!(denoise_step(&gguf, &bytes, &[1, 2], &[0, 0], (0, 2)).is_err());
     assert!(denoise_step(&gguf, &bytes, &[1, 9], &[0], (0, 2)).is_err());
     assert!(denoise_topk(&gguf, &bytes, &[1, 2], &[0], (0, 2), 0).is_err());
-    assert!(denoise_topk(&gguf, &bytes, &[1, 2], &[0], (0, 2), 99).is_ok());
+    let clamped = denoise_topk(&gguf, &bytes, &[1, 2], &[0], (0, 2), 99).expect("clamped");
+    assert_eq!(clamped.top_k, 5);
 }
 
 #[test]
@@ -282,6 +477,15 @@ fn real_dllm_denoise_smoke() {
     let positions: Vec<usize> = (0..8).collect();
     let started = std::time::Instant::now();
     let out = denoise_step(&gguf, &bytes, &tokens, &positions, (0, 8)).expect("denoise");
+    assert_eq!(out.vocab_size, config.vocab_size);
+    assert_eq!(out.positions.len(), positions.len());
+    assert_eq!(out.logits.len(), positions.len() * config.vocab_size);
+    assert!(out.logits.iter().all(|value| value.is_finite()));
+    assert!(
+        out.confidence
+            .iter()
+            .all(|value| *value >= 0.0 && *value <= 1.0)
+    );
     println!(
         "dllm smoke vocab={} positions={} ms={}",
         config.vocab_size,
