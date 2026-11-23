@@ -24,6 +24,42 @@ pub fn rms_norm(input: &[f32], weight: Option<&[f32]>, eps: f32) -> Vec<f32> {
         .collect()
 }
 
+/// RMSNorm over a flat `[rows][width]` matrix, returning the same layout.
+///
+/// This is the batched sibling of [`rms_norm`]; the per-row work is unchanged so
+/// the numbers stay identical to the single-row path.
+pub fn rms_norm_batch(
+    input: &[f32],
+    rows: usize,
+    width: usize,
+    weight: Option<&[f32]>,
+    eps: f32,
+) -> Vec<f32> {
+    let mut out = Vec::with_capacity(rows * width);
+    for row in 0..rows {
+        let start = row * width;
+        out.extend_from_slice(&rms_norm(&input[start..start + width], weight, eps));
+    }
+    out
+}
+
+/// LayerNorm over a flat `[rows][width]` matrix.
+pub fn layer_norm_batch(
+    input: &[f32],
+    rows: usize,
+    width: usize,
+    weight: &[f32],
+    bias: &[f32],
+    eps: f32,
+) -> Vec<f32> {
+    let mut out = Vec::with_capacity(rows * width);
+    for row in 0..rows {
+        let start = row * width;
+        out.extend_from_slice(&layer_norm(&input[start..start + width], weight, bias, eps));
+    }
+    out
+}
+
 /// LayerNorm with weight and bias.
 pub fn layer_norm(input: &[f32], weight: &[f32], bias: &[f32], eps: f32) -> Vec<f32> {
     if input.is_empty() {

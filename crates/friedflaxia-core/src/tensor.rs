@@ -3,7 +3,8 @@
 use crate::gguf::{Gguf, GgufError, TensorInfo, TensorType};
 use crate::quant::{
     MatvecError, QuantError, dequantize_bf16, dequantize_q4_0, dequantize_q6_k, dequantize_q8_0,
-    matvec_bf16, matvec_f32, matvec_q4_0, matvec_q4_1, matvec_q6_k, matvec_q8_0,
+    matmul_q4_0, matmul_q8_0, matvec_bf16, matvec_f32, matvec_q4_0, matvec_q4_1, matvec_q6_k,
+    matvec_q8_0,
 };
 use std::fmt;
 
@@ -50,6 +51,48 @@ impl<'a> TensorView<'a> {
             other => return Err(TensorError::UnsupportedType(other)),
         };
         result.map_err(TensorError::Matvec)
+    }
+
+    /// Batched matrix-matrix product: `inputs` is `[n_tokens][cols]` and the
+    /// result is `[n_tokens][rows]`.
+    ///
+    /// Types without a dedicated batched kernel fall back to one matvec per
+    /// token, so callers never have to special-case the quant format.
+    pub fn matmul(&self, inputs: &[f32], n_tokens: usize) -> Result<Vec<f32>, TensorError> {
+        let rows = self.rows();
+        let cols = self.cols();
+        if n_tokens == 0 {
+            return Err(TensorError::Shape {
+                tensor: self.info.name.clone(),
+                expected: 1,
+                actual: 0,
+            });
+        }
+        if inputs.len() != n_tokens.saturating_mul(cols) {
+            return Err(TensorError::Shape {
+                tensor: self.info.name.clone(),
+                expected: n_tokens.saturating_mul(cols),
+                actual: inputs.len(),
+            });
+        }
+        if n_tokens == 1 {
+            return self.matvec(inputs);
+        }
+        let mut out = vec![0.0f32; n_tokens * rows];
+        let result = match self.info.tensor_type {
+            TensorType::Q8_0 => matmul_q8_0(self.bytes, rows, cols, inputs, n_tokens, &mut out),
+            TensorType::Q4_0 => matmul_q4_0(self.bytes, rows, cols, inputs, n_tokens, &mut out),
+            _ => {
+                for token in 0..n_tokens {
+                    let start = token * cols;
+                    let projected = self.matvec(&inputs[start..start + cols])?;
+                    out[token * rows..token * rows + projected.len()].copy_from_slice(&projected);
+                }
+                Ok(())
+            }
+        };
+        result.map_err(TensorError::Matvec)?;
+        Ok(out)
     }
 
     /// Read one row of a matrix (or the whole 1-D tensor) as f32.
