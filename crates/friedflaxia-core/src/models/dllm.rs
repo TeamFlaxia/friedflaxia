@@ -5,8 +5,10 @@
 //!
 //! - queries inside the active block `[start, end)` attend to the clean prefix
 //!   and bidirectionally to every token in the block,
-//! - queries outside the block fall back to causal attention. Their outputs are
-//!   not scored; the fallback only keeps the batched forward well-defined.
+//! - queries outside the block use causal attention. They are normally not
+//!   scored; the caller may still request a prefix position for logprob audits.
+//! - tokens at or after `end` are never read, so the backbone runs over the
+//!   prefix plus the block only.
 //!
 //! The host owns sampling, Self-Repulsion and distribution merging. This module
 //! returns per-position logits (or top-k candidates) and the max-softmax
@@ -55,7 +57,7 @@ impl DllmConfig {
                 // must not silently truncate the head.
                 if n_head == 0 || n_embd % n_head != 0 {
                     return Err(ModelError::Shape(
-                        "qwen3-dllm needs attention.key_length when n_embd is not divisible by head_count"
+                        "missing attention.key_length (required when n_embd is not divisible by head_count)"
                             .into(),
                     ));
                 }
@@ -181,6 +183,25 @@ fn validate_input(
     Ok(())
 }
 
+/// Validate, truncate the tail and run the backbone once.
+///
+/// Both public entry points share this preamble so a future validation or
+/// cache change cannot drift between them.
+fn run_backbone(
+    gguf: &Gguf,
+    file: &[u8],
+    tokens: &[u32],
+    positions: &[usize],
+    block: (usize, usize),
+) -> Result<(DllmConfig, Vec<f32>), ModelError> {
+    let config = DllmConfig::from_gguf(gguf)?;
+    validate_input(&config, tokens, positions, block)?;
+    // Tokens at or after block.1 cannot influence a query before block.1 under
+    // the block mask, so the backbone only needs the prefix plus the block.
+    let hidden = forward_hidden(gguf, file, &config, &tokens[..block.1], block)?;
+    Ok((config, hidden))
+}
+
 /// One denoising step over `tokens`, returning full logits for `positions`.
 pub fn denoise_step(
     gguf: &Gguf,
@@ -189,12 +210,7 @@ pub fn denoise_step(
     positions: &[usize],
     block: (usize, usize),
 ) -> Result<DenoiseStepOutput, ModelError> {
-    let config = DllmConfig::from_gguf(gguf)?;
-    validate_input(&config, tokens, positions, block)?;
-    // Tokens at or after block.1 cannot influence a query before block.1 under
-    // the block mask, so the backbone only needs the prefix plus the block.
-    let visible = &tokens[..block.1];
-    let hidden = forward_hidden(gguf, file, &config, visible, block)?;
+    let (config, hidden) = run_backbone(gguf, file, tokens, positions, block)?;
     let logits = projected_logits(gguf, file, &config, &hidden, positions)?;
     let confidence = logits
         .chunks_exact(config.vocab_size)
@@ -228,13 +244,12 @@ pub fn denoise_topk(
     if top_k == 0 {
         return Err(ModelError::Invalid("top_k must be at least 1"));
     }
-    let config = DllmConfig::from_gguf(gguf)?;
-    validate_input(&config, tokens, positions, block)?;
-    let visible = &tokens[..block.1];
-    let hidden = forward_hidden(gguf, file, &config, visible, block)?;
+    let (config, hidden) = run_backbone(gguf, file, tokens, positions, block)?;
     // Keep all requested positions in one output projection. The output matrix
     // is the largest tensor in a 4B model, so chunking by position would stream
-    // it p/chunk times; p is bounded by the caller's block size.
+    // it p/chunk times; p is bounded by the caller's block size. If the peak
+    // logits buffer ever matters, chunk by vocabulary rows with a streaming
+    // logsumexp instead, which keeps the single weight stream.
     let logits = projected_logits(gguf, file, &config, &hidden, positions)?;
     let vocab_size = config.vocab_size;
     let k = top_k.min(vocab_size);
@@ -504,13 +519,13 @@ fn softmax_stats(row: &[f32]) -> (f32, f32) {
     (max, sum)
 }
 
-/// A NaN logit must never outrank a real candidate.
+/// A non-finite logit must never outrank or outweigh a real candidate.
 fn score(row: &[f32], index: usize) -> f32 {
     let value = row[index];
-    if value.is_nan() {
-        f32::NEG_INFINITY
-    } else {
+    if value.is_finite() {
         value
+    } else {
+        f32::NEG_INFINITY
     }
 }
 
@@ -597,6 +612,14 @@ mod tests {
         let row = [f32::NAN, 0.1, f32::NAN, 0.2];
         assert_eq!(top_k_indices(&row, 1), vec![3]);
         assert_eq!(top_k_indices(&row, 4)[..2], [3, 1]);
+    }
+
+    #[test]
+    fn infinite_scores_are_not_selected() {
+        let row = [f32::INFINITY, 0.1, 0.2];
+        assert_eq!(top_k_indices(&row, 1), vec![2]);
+        let row = [f32::NEG_INFINITY, 0.1, 0.2];
+        assert_eq!(top_k_indices(&row, 1), vec![2]);
     }
 
     #[test]
