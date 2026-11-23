@@ -305,6 +305,28 @@ fn run_layer(
     if q_norm.len() != head_dim || k_norm.len() != head_dim {
         return Err(ModelError::Shape(format!("{prefix} q/k norm length")));
     }
+    if wo.rows() != width || wo.cols() != q_dim {
+        return Err(ModelError::Shape(format!(
+            "{prefix} attention output shape"
+        )));
+    }
+    if ffn_gate.rows() != config.n_ff
+        || ffn_gate.cols() != width
+        || ffn_up.rows() != config.n_ff
+        || ffn_up.cols() != width
+        || ffn_down.rows() != width
+        || ffn_down.cols() != config.n_ff
+    {
+        return Err(ModelError::Shape(format!("{prefix} ffn shape")));
+    }
+    if inp_gate.rows() != config.n_embd_per_layer || inp_gate.cols() != width {
+        return Err(ModelError::Shape(format!("{prefix} inp_gate shape")));
+    }
+    if per_layer_proj.rows() != width || per_layer_proj.cols() != config.n_embd_per_layer {
+        return Err(ModelError::Shape(format!(
+            "{prefix} per-layer projection shape"
+        )));
+    }
     let freq_base = if config.swa_pattern[layer] {
         config.rope_freq_base_swa
     } else {

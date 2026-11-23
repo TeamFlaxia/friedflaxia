@@ -138,7 +138,8 @@ impl<'a> PlamoSession<'a> {
     /// Feed every prompt token and return the final token's logits.
     ///
     /// The whole prompt goes through each projection as one batch, so the
-    /// weight matrices are streamed once per layer instead of once per token.
+    /// weight matrices are streamed once per 16-token tile instead of once per
+    /// token.
     pub fn prefill(&mut self, token_ids: &[u32]) -> Result<Vec<f32>, ModelError> {
         if token_ids.is_empty() {
             return Err(ModelError::Invalid("token_ids must not be empty"));
@@ -204,6 +205,7 @@ impl<'a> PlamoSession<'a> {
 
         self.pos += 1;
         let output_norm = tensor(self.gguf, self.file, "output_norm.weight")?.vec()?;
+        debug_assert_eq!(hidden.len(), width);
         let normed = rms_norm(&hidden[..width], Some(&output_norm), self.config.eps);
         tensor(self.gguf, self.file, "output.weight")?
             .matvec(&normed)
@@ -321,6 +323,13 @@ fn run_layer(
     if hidden.len() != n_tokens * width {
         return Err(ModelError::Shape(format!("{prefix} hidden shape")));
     }
+    // A failed prefill can leave entries behind without advancing the session;
+    // reject that state instead of appending duplicates.
+    if keys.len() != base_pos || values.len() != base_pos {
+        return Err(ModelError::Shape(format!(
+            "{prefix} attention cache length"
+        )));
+    }
     let q_dim = config.n_head * config.head_dim;
     let k_dim = config.n_head_kv * config.head_dim;
     let v_dim = config.n_head_kv * config.head_dim;
@@ -338,9 +347,18 @@ fn run_layer(
         )
     };
     let window = config.swa_pattern[layer].then_some(config.n_swa);
+    if wo.rows() != width || wo.cols() != q_dim {
+        return Err(ModelError::Shape(format!(
+            "{prefix} attention output shape"
+        )));
+    }
+    if ffn_down.rows() != width || ffn_down.cols() != config.n_ff {
+        return Err(ModelError::Shape(format!("{prefix} ffn_down shape")));
+    }
 
     let normed = rms_norm_batch(hidden, n_tokens, width, Some(&attn_norm), config.eps);
     let mut qkv = wqkv.matmul(&normed, n_tokens)?;
+    drop(normed);
     if qkv.len() != n_tokens * qkv_dim {
         return Err(ModelError::Shape(format!("{prefix} qkv dimension")));
     }
@@ -410,7 +428,7 @@ fn run_layer(
             Some(window) if window > 0 => position.saturating_sub(window - 1),
             _ => 0,
         };
-        if start > position || keys.len() <= position {
+        if keys.len() < position + 1 || values.len() != keys.len() {
             return Err(ModelError::Shape(format!("{prefix} attention cache")));
         }
         let q_row = &qkv[token * qkv_dim..token * qkv_dim + q_dim];
