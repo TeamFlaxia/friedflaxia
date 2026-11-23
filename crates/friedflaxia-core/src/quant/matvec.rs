@@ -35,11 +35,16 @@ impl fmt::Display for MatvecError {
 
 impl std::error::Error for MatvecError {}
 
-fn validate(
+/// Tokens processed per weight-block pass in the batched kernels.
+///
+/// The block is dequantized once and reused for this many input vectors, which
+/// is what turns the per-token memory traffic into a single streaming pass.
+pub const MATMUL_TILE_TOKENS: usize = 16;
+
+fn validate_shape(
     weights: &[u8],
     rows: usize,
     cols: usize,
-    input: &[f32],
     elements_per_block: usize,
     bytes_per_block: usize,
 ) -> Result<usize, MatvecError> {
@@ -50,12 +55,6 @@ fn validate(
         return Err(MatvecError::InvalidShape(
             "cols must be a whole number of quant blocks",
         ));
-    }
-    if input.len() != cols {
-        return Err(MatvecError::InputLength {
-            expected: cols,
-            actual: input.len(),
-        });
     }
     let blocks_per_row = cols / elements_per_block;
     let expected = rows
@@ -69,6 +68,193 @@ fn validate(
         });
     }
     Ok(blocks_per_row)
+}
+
+fn validate(
+    weights: &[u8],
+    rows: usize,
+    cols: usize,
+    input: &[f32],
+    elements_per_block: usize,
+    bytes_per_block: usize,
+) -> Result<usize, MatvecError> {
+    let blocks_per_row = validate_shape(weights, rows, cols, elements_per_block, bytes_per_block)?;
+    if input.len() != cols {
+        return Err(MatvecError::InputLength {
+            expected: cols,
+            actual: input.len(),
+        });
+    }
+    Ok(blocks_per_row)
+}
+
+/// Check the shapes shared by every batched kernel.
+///
+/// `inputs` is `[n_tokens][cols]` and `out` is `[n_tokens][rows]`, so a caller
+/// can keep each token's projected vector contiguous.
+#[allow(clippy::too_many_arguments)]
+fn validate_matmul(
+    weights: &[u8],
+    rows: usize,
+    cols: usize,
+    inputs: &[f32],
+    n_tokens: usize,
+    out: &[f32],
+    elements_per_block: usize,
+    bytes_per_block: usize,
+) -> Result<usize, MatvecError> {
+    let blocks = validate_shape(weights, rows, cols, elements_per_block, bytes_per_block)?;
+    if n_tokens == 0 {
+        return Err(MatvecError::InvalidShape("n_tokens must be non-zero"));
+    }
+    let expected_inputs = n_tokens
+        .checked_mul(cols)
+        .ok_or(MatvecError::IntegerOverflow)?;
+    if inputs.len() != expected_inputs {
+        return Err(MatvecError::InputLength {
+            expected: expected_inputs,
+            actual: inputs.len(),
+        });
+    }
+    let expected_out = n_tokens
+        .checked_mul(rows)
+        .ok_or(MatvecError::IntegerOverflow)?;
+    if out.len() != expected_out {
+        return Err(MatvecError::WeightLength {
+            expected: expected_out,
+            actual: out.len(),
+        });
+    }
+    Ok(blocks)
+}
+
+/// Batched Q8_0 matmul: `out[token * rows + row] = dot(weights[row], inputs[token])`.
+///
+/// The loop order is the whole point: one quantized weight block is dequantized
+/// once and then reused for every token in the tile, so the weight traffic drops
+/// by the tile width instead of streaming the matrix once per token. The matrix
+/// is therefore streamed once per 16-token tile, not once per token.
+pub fn matmul_q8_0(
+    weights: &[u8],
+    rows: usize,
+    cols: usize,
+    inputs: &[f32],
+    n_tokens: usize,
+    out: &mut [f32],
+) -> Result<(), MatvecError> {
+    let blocks = validate_matmul(
+        weights,
+        rows,
+        cols,
+        inputs,
+        n_tokens,
+        out,
+        QK,
+        Q8_0_BLOCK_BYTES,
+    )?;
+    if n_tokens == 1 {
+        let result = matvec_q8_0(weights, rows, cols, inputs)?;
+        out.copy_from_slice(&result);
+        return Ok(());
+    }
+    // Every (token, row) is written exactly once below, so the output does not
+    // need a separate zeroing pass.
+    for start_token in (0..n_tokens).step_by(MATMUL_TILE_TOKENS) {
+        let tile = (n_tokens - start_token).min(MATMUL_TILE_TOKENS);
+        for row in 0..rows {
+            let row_bytes = &weights[row * blocks * Q8_0_BLOCK_BYTES..];
+            let mut acc = [0.0f32; MATMUL_TILE_TOKENS];
+            for block in 0..blocks {
+                let bytes = &row_bytes[block * Q8_0_BLOCK_BYTES..(block + 1) * Q8_0_BLOCK_BYTES];
+                let scale = f16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]]));
+                let offset = block * QK;
+                let mut dequantized = [0.0f32; QK];
+                for (index, value) in dequantized.iter_mut().enumerate() {
+                    *value = (bytes[2 + index] as i8) as f32;
+                }
+                for index in 0..tile {
+                    let input_block = &inputs[(start_token + index) * cols + offset..][..QK];
+                    let dot = if simd::is_enabled() {
+                        simd::dot(&dequantized, input_block)
+                    } else {
+                        let mut dot = 0.0f32;
+                        for lane in 0..QK {
+                            dot += dequantized[lane] * input_block[lane];
+                        }
+                        dot
+                    };
+                    acc[index] += scale * dot;
+                }
+            }
+            for index in 0..tile {
+                out[(start_token + index) * rows + row] = acc[index];
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Batched Q4_0 matmul. See [`matmul_q8_0`] for the loop-order rationale.
+pub fn matmul_q4_0(
+    weights: &[u8],
+    rows: usize,
+    cols: usize,
+    inputs: &[f32],
+    n_tokens: usize,
+    out: &mut [f32],
+) -> Result<(), MatvecError> {
+    let blocks = validate_matmul(
+        weights,
+        rows,
+        cols,
+        inputs,
+        n_tokens,
+        out,
+        QK,
+        Q4_0_BLOCK_BYTES,
+    )?;
+    if n_tokens == 1 {
+        let result = matvec_q4_0(weights, rows, cols, inputs)?;
+        out.copy_from_slice(&result);
+        return Ok(());
+    }
+    // Every (token, row) is written exactly once below, so the output does not
+    // need a separate zeroing pass.
+    for start_token in (0..n_tokens).step_by(MATMUL_TILE_TOKENS) {
+        let tile = (n_tokens - start_token).min(MATMUL_TILE_TOKENS);
+        for row in 0..rows {
+            let row_bytes = &weights[row * blocks * Q4_0_BLOCK_BYTES..];
+            let mut acc = [0.0f32; MATMUL_TILE_TOKENS];
+            for block in 0..blocks {
+                let bytes = &row_bytes[block * Q4_0_BLOCK_BYTES..(block + 1) * Q4_0_BLOCK_BYTES];
+                let scale = f16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]]));
+                let offset = block * QK;
+                let mut dequantized = [0.0f32; QK];
+                for lane in 0..QK / 2 {
+                    let packed = bytes[2 + lane];
+                    dequantized[lane] = ((packed & 0x0f) as i8 - 8) as f32;
+                    dequantized[QK / 2 + lane] = ((packed >> 4) as i8 - 8) as f32;
+                }
+                for index in 0..tile {
+                    let input_block = &inputs[(start_token + index) * cols + offset..][..QK];
+                    let dot = if simd::is_enabled() {
+                        simd::dot(&dequantized, input_block)
+                    } else {
+                        let mut dot = 0.0f32;
+                        for lane in 0..QK {
+                            dot += dequantized[lane] * input_block[lane];
+                        }
+                        dot
+                    };
+                    acc[index] += scale * dot;
+                }
+            }
+            for index in 0..tile {
+                out[(start_token + index) * rows + row] = acc[index];
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn matvec_q8_0(

@@ -14,7 +14,8 @@ mod q8_0;
 pub use bf16::dequantize_bf16;
 pub use f16::f16_to_f32;
 pub use matvec::{
-    MatvecError, matvec_bf16, matvec_f32, matvec_q4_0, matvec_q4_1, matvec_q6_k, matvec_q8_0,
+    MATMUL_TILE_TOKENS, MatvecError, matmul_q4_0, matmul_q8_0, matvec_bf16, matvec_f32,
+    matvec_q4_0, matvec_q4_1, matvec_q6_k, matvec_q8_0,
 };
 pub use q4_0::dequantize_q4_0;
 pub use q4_1::dequantize_q4_1;

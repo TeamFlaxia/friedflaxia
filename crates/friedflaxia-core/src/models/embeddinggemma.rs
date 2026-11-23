@@ -7,7 +7,9 @@
 
 use super::ModelError;
 use crate::gguf::{Gguf, ModelConfig};
-use crate::ops::{gelu_tanh, l2_normalize, rms_norm, rope_neox_inplace, softmax_in_place};
+use crate::ops::{
+    gelu_tanh, l2_normalize, rms_norm, rms_norm_batch, rope_neox_inplace, softmax_in_place,
+};
 use crate::tensor::tensor;
 
 const DEFAULT_SLIDING_WINDOW: u32 = 1024;
@@ -132,15 +134,18 @@ pub fn embed_text_with_features(
     let video_rows = video_features.len() / width;
     let audio_rows = audio_features.len() / width;
     let expected = |token: u32| token_ids.iter().filter(|id| **id == token).count();
-    if expected(IMAGE_TOKEN) != image_rows
-        || expected(VIDEO_TOKEN) != video_rows
-        || expected(AUDIO_TOKEN) != audio_rows
+    // A host may pass features for media that the token budget dropped from the
+    // end of the sequence, so require at least as many rows as the ids use.
+    if expected(IMAGE_TOKEN) > image_rows
+        || expected(VIDEO_TOKEN) > video_rows
+        || expected(AUDIO_TOKEN) > audio_rows
     {
         return Err(ModelError::Shape("multimodal feature count".into()));
     }
 
     let input_scale = (config.n_embd as f32).sqrt();
-    let mut hidden = Vec::with_capacity(token_ids.len());
+    let n_tokens = token_ids.len();
+    let mut hidden = Vec::with_capacity(n_tokens * width);
     let mut image_index = 0usize;
     let mut video_index = 0usize;
     let mut audio_index = 0usize;
@@ -167,28 +172,40 @@ pub fn embed_text_with_features(
             }
             _ => None,
         };
-        if let Some(feature) = feature {
-            hidden.push(feature.to_vec());
-        } else {
-            hidden.push(row);
+        match feature {
+            Some(feature) => hidden.extend_from_slice(feature),
+            None => hidden.extend_from_slice(&row),
         }
     }
 
-    let per_layer = build_per_layer_inputs(gguf, file, &config, &hidden)?;
+    let per_layer = build_per_layer_inputs(gguf, file, &config, &hidden, n_tokens)?;
 
     for (layer, per_layer_input) in per_layer.iter().enumerate() {
-        hidden = run_layer(gguf, file, &config, layer, hidden, per_layer_input)?;
+        hidden = run_layer(
+            gguf,
+            file,
+            &config,
+            layer,
+            &hidden,
+            n_tokens,
+            per_layer_input,
+        )?;
     }
 
     let output_norm = tensor(gguf, file, "output_norm.weight")?.vec()?;
     let mut pooled = vec![0.0f32; config.n_embd];
-    for row in &hidden {
-        let normed = rms_norm(row, Some(&output_norm), config.eps);
+    for token in 0..n_tokens {
+        let start = token * width;
+        let normed = rms_norm(
+            &hidden[start..start + width],
+            Some(&output_norm),
+            config.eps,
+        );
         for (index, value) in normed.iter().enumerate() {
             pooled[index] += value;
         }
     }
-    let scale = 1.0 / hidden.len() as f32;
+    let scale = 1.0 / n_tokens as f32;
     for value in &mut pooled {
         *value *= scale;
     }
@@ -201,28 +218,34 @@ pub fn embed_text_with_features(
     Ok(l2_normalize(&embedding))
 }
 
+/// Per-layer inputs for every token, one flat `[n_tokens][n_embd_per_layer]`
+/// matrix per layer.
 fn build_per_layer_inputs(
     gguf: &Gguf,
     file: &[u8],
     config: &EmbeddingGemmaConfig,
-    hidden: &[Vec<f32>],
-) -> Result<Vec<Vec<Vec<f32>>>, ModelError> {
+    hidden: &[f32],
+    n_tokens: usize,
+) -> Result<Vec<Vec<f32>>, ModelError> {
     let projection = tensor(gguf, file, "per_layer_model_proj.weight")?;
     let norm = tensor(gguf, file, "per_layer_proj_norm.weight")?.vec()?;
     let scale = 1.0 / (config.n_embd as f32).sqrt();
+    let per_layer_width = config.n_embd_per_layer;
+    let projected = projection.matmul(hidden, n_tokens)?;
+    let expected = config.n_layer * per_layer_width;
+    if projected.len() != n_tokens * expected {
+        return Err(ModelError::Shape("per_layer_model_proj output".into()));
+    }
 
-    let mut out = vec![vec![vec![0.0f32; config.n_embd_per_layer]; hidden.len()]; config.n_layer];
-    for (token, row) in hidden.iter().enumerate() {
-        let projected = projection.matvec(row)?;
-        let expected = config.n_layer * config.n_embd_per_layer;
-        if projected.len() != expected {
-            return Err(ModelError::Shape("per_layer_model_proj output".into()));
-        }
+    let mut out = vec![vec![0.0f32; n_tokens * per_layer_width]; config.n_layer];
+    for token in 0..n_tokens {
         for (layer, out_layer) in out.iter_mut().enumerate() {
-            let start = layer * config.n_embd_per_layer;
-            let slice = &projected[start..start + config.n_embd_per_layer];
+            let start = token * expected + layer * per_layer_width;
+            let slice = &projected[start..start + per_layer_width];
             let scaled: Vec<f32> = slice.iter().map(|value| value * scale).collect();
-            out_layer[token] = rms_norm(&scaled, Some(&norm), config.eps);
+            let normalized = rms_norm(&scaled, Some(&norm), config.eps);
+            let dest = token * per_layer_width;
+            out_layer[dest..dest + per_layer_width].copy_from_slice(&normalized);
         }
     }
     Ok(out)
@@ -233,9 +256,10 @@ fn run_layer(
     file: &[u8],
     config: &EmbeddingGemmaConfig,
     layer: usize,
-    hidden: Vec<Vec<f32>>,
-    per_layer_input: &[Vec<f32>],
-) -> Result<Vec<Vec<f32>>, ModelError> {
+    hidden: &[f32],
+    n_tokens: usize,
+    per_layer_input: &[f32],
+) -> Result<Vec<f32>, ModelError> {
     let prefix = format!("blk.{layer}");
     let attn_norm = tensor(gguf, file, &format!("{prefix}.attn_norm.weight"))?.vec()?;
     let wq = tensor(gguf, file, &format!("{prefix}.attn_q.weight"))?;
@@ -258,7 +282,13 @@ fn run_layer(
     let per_layer_post_norm = tensor(gguf, file, &format!("{prefix}.post_norm.weight"))?.vec()?;
     let out_scale = tensor(gguf, file, &format!("{prefix}.layer_output_scale.weight"))?.scalar()?;
 
-    let n_tokens = hidden.len();
+    let width = config.n_embd;
+    if hidden.len() != n_tokens * width {
+        return Err(ModelError::Shape(format!("{prefix} hidden shape")));
+    }
+    if per_layer_input.len() != n_tokens * config.n_embd_per_layer {
+        return Err(ModelError::Shape(format!("{prefix} per-layer input shape")));
+    }
     let q_dim = wq.rows();
     if q_dim % config.n_head != 0 {
         return Err(ModelError::Shape(format!("{prefix} q dimension")));
@@ -275,6 +305,28 @@ fn run_layer(
     if q_norm.len() != head_dim || k_norm.len() != head_dim {
         return Err(ModelError::Shape(format!("{prefix} q/k norm length")));
     }
+    if wo.rows() != width || wo.cols() != q_dim {
+        return Err(ModelError::Shape(format!(
+            "{prefix} attention output shape"
+        )));
+    }
+    if ffn_gate.rows() != config.n_ff
+        || ffn_gate.cols() != width
+        || ffn_up.rows() != config.n_ff
+        || ffn_up.cols() != width
+        || ffn_down.rows() != width
+        || ffn_down.cols() != config.n_ff
+    {
+        return Err(ModelError::Shape(format!("{prefix} ffn shape")));
+    }
+    if inp_gate.rows() != config.n_embd_per_layer || inp_gate.cols() != width {
+        return Err(ModelError::Shape(format!("{prefix} inp_gate shape")));
+    }
+    if per_layer_proj.rows() != width || per_layer_proj.cols() != config.n_embd_per_layer {
+        return Err(ModelError::Shape(format!(
+            "{prefix} per-layer projection shape"
+        )));
+    }
     let freq_base = if config.swa_pattern[layer] {
         config.rope_freq_base_swa
     } else {
@@ -286,56 +338,40 @@ fn run_layer(
         None
     };
 
-    let mut q_heads = Vec::with_capacity(n_tokens);
-    let mut k_heads = Vec::with_capacity(n_tokens);
-    let mut v_heads = Vec::with_capacity(n_tokens);
-    for (position, row) in hidden.iter().enumerate() {
-        let normed = rms_norm(row, Some(&attn_norm), config.eps);
-        let q = wq.matvec(&normed)?;
-        let k = wk.matvec(&normed)?;
-        let v = wv.matvec(&normed)?;
+    // One GEMM per projection: the weight matrix is streamed once for the whole
+    // sequence instead of once per token.
+    let normed = rms_norm_batch(hidden, n_tokens, width, Some(&attn_norm), config.eps);
+    let mut q_all = wq.matmul(&normed, n_tokens)?;
+    let mut k_all = wk.matmul(&normed, n_tokens)?;
+    let mut v_all = wv.matmul(&normed, n_tokens)?;
 
-        let mut qn = vec![0.0f32; q_dim];
+    for position in 0..n_tokens {
+        let q = &mut q_all[position * q_dim..(position + 1) * q_dim];
         for head in 0..config.n_head {
             let start = head * head_dim;
             let normalized = rms_norm(&q[start..start + head_dim], Some(&q_norm), config.eps);
-            qn[start..start + head_dim].copy_from_slice(&normalized);
+            q[start..start + head_dim].copy_from_slice(&normalized);
         }
-        rope_neox_inplace(&mut qn, config.n_head, head_dim, position, freq_base);
+        rope_neox_inplace(q, config.n_head, head_dim, position, freq_base);
 
-        let mut kn = vec![0.0f32; kv_dim];
+        let k = &mut k_all[position * kv_dim..(position + 1) * kv_dim];
         for head in 0..n_head_kv {
             let start = head * head_dim;
             let normalized = rms_norm(&k[start..start + head_dim], Some(&k_norm), config.eps);
-            kn[start..start + head_dim].copy_from_slice(&normalized);
+            k[start..start + head_dim].copy_from_slice(&normalized);
         }
-        rope_neox_inplace(&mut kn, n_head_kv, head_dim, position, freq_base);
+        rope_neox_inplace(k, n_head_kv, head_dim, position, freq_base);
 
-        let mut vn = vec![0.0f32; kv_dim];
+        let v = &mut v_all[position * kv_dim..(position + 1) * kv_dim];
         for head in 0..n_head_kv {
             let start = head * head_dim;
             let normalized = rms_norm(&v[start..start + head_dim], None, config.eps);
-            vn[start..start + head_dim].copy_from_slice(&normalized);
+            v[start..start + head_dim].copy_from_slice(&normalized);
         }
-
-        q_heads.push(
-            (0..config.n_head)
-                .map(|h| qn[h * head_dim..(h + 1) * head_dim].to_vec())
-                .collect::<Vec<_>>(),
-        );
-        k_heads.push(
-            (0..n_head_kv)
-                .map(|h| kn[h * head_dim..(h + 1) * head_dim].to_vec())
-                .collect::<Vec<_>>(),
-        );
-        v_heads.push(
-            (0..n_head_kv)
-                .map(|h| vn[h * head_dim..(h + 1) * head_dim].to_vec())
-                .collect::<Vec<_>>(),
-        );
     }
 
-    let mut next = Vec::with_capacity(n_tokens);
+    let mut concat = vec![0.0f32; n_tokens * q_dim];
+    let mut scores: Vec<f32> = Vec::new();
     for token in 0..n_tokens {
         let (start, end) = match window {
             Some(window) => {
@@ -344,70 +380,77 @@ fn run_layer(
             }
             None => (0, n_tokens - 1),
         };
-        let mut concat = vec![0.0f32; config.n_head * head_dim];
         for head in 0..config.n_head {
             let kv_head = head / (config.n_head / n_head_kv);
-            let keys = &k_heads[start..=end];
-            let values = &v_heads[start..=end];
-            let mut scores: Vec<f32> = keys
-                .iter()
-                .map(|key| {
-                    q_heads[token][head]
-                        .iter()
-                        .zip(&key[kv_head])
-                        .map(|(q, k)| q * k)
-                        .sum()
-                })
-                .collect();
+            let q_head =
+                &q_all[token * q_dim + head * head_dim..token * q_dim + (head + 1) * head_dim];
+            scores.clear();
+            scores.extend((start..=end).map(|other| {
+                let key = &k_all[other * kv_dim + kv_head * head_dim
+                    ..other * kv_dim + (kv_head + 1) * head_dim];
+                q_head.iter().zip(key).map(|(q, k)| q * k).sum::<f32>()
+            }));
             softmax_in_place(&mut scores);
-            let out = &mut concat[head * head_dim..(head + 1) * head_dim];
-            for (weight, value) in scores.iter().zip(values) {
-                for (index, value) in value[kv_head].iter().enumerate() {
+            let out =
+                &mut concat[token * q_dim + head * head_dim..token * q_dim + (head + 1) * head_dim];
+            for (weight, other) in scores.iter().zip(start..=end) {
+                let value = &v_all[other * kv_dim + kv_head * head_dim
+                    ..other * kv_dim + (kv_head + 1) * head_dim];
+                for (index, value) in value.iter().enumerate() {
                     out[index] += weight * value;
                 }
             }
         }
-
-        let projected = wo.matvec(&concat)?;
-        let post = rms_norm(&projected, Some(&attn_post_norm), config.eps);
-        let attn_out: Vec<f32> = hidden[token]
-            .iter()
-            .zip(post)
-            .map(|(residual, value)| residual + value)
-            .collect();
-
-        let ffn_in = rms_norm(&attn_out, Some(&ffn_norm), config.eps);
-        let gate = ffn_gate.matvec(&ffn_in)?;
-        let up = ffn_up.matvec(&ffn_in)?;
-        let activated: Vec<f32> = gate
-            .iter()
-            .zip(up)
-            .map(|(gate, up)| gelu_tanh(*gate) * up)
-            .collect();
-        let down = ffn_down.matvec(&activated)?;
-        let ffn_post = rms_norm(&down, Some(&ffn_post_norm), config.eps);
-        let mut cur: Vec<f32> = attn_out
-            .iter()
-            .zip(ffn_post)
-            .map(|(residual, value)| residual + value)
-            .collect();
-
-        let gate = inp_gate.matvec(&cur)?;
-        let gated: Vec<f32> = gate
-            .iter()
-            .zip(&per_layer_input[token])
-            .map(|(gate, input)| gelu_tanh(*gate) * input)
-            .collect();
-        let projected = per_layer_proj.matvec(&gated)?;
-        let normed = rms_norm(&projected, Some(&per_layer_post_norm), config.eps);
-        for (value, add) in cur.iter_mut().zip(normed) {
-            *value += add;
-        }
-        for value in &mut cur {
-            *value *= out_scale;
-        }
-        next.push(cur);
     }
 
-    Ok(next)
+    let projected = wo.matmul(&concat, n_tokens)?;
+    let post = rms_norm_batch(
+        &projected,
+        n_tokens,
+        width,
+        Some(&attn_post_norm),
+        config.eps,
+    );
+    let mut cur: Vec<f32> = hidden
+        .iter()
+        .zip(&post)
+        .map(|(residual, value)| residual + value)
+        .collect();
+
+    let ffn_in = rms_norm_batch(&cur, n_tokens, width, Some(&ffn_norm), config.eps);
+    let gate = ffn_gate.matmul(&ffn_in, n_tokens)?;
+    let up = ffn_up.matmul(&ffn_in, n_tokens)?;
+    let activated: Vec<f32> = gate
+        .iter()
+        .zip(&up)
+        .map(|(gate, up)| gelu_tanh(*gate) * up)
+        .collect();
+    let down = ffn_down.matmul(&activated, n_tokens)?;
+    let ffn_post = rms_norm_batch(&down, n_tokens, width, Some(&ffn_post_norm), config.eps);
+    for (value, add) in cur.iter_mut().zip(&ffn_post) {
+        *value += add;
+    }
+
+    let gate = inp_gate.matmul(&cur, n_tokens)?;
+    let gated: Vec<f32> = gate
+        .iter()
+        .zip(per_layer_input)
+        .map(|(gate, input)| gelu_tanh(*gate) * input)
+        .collect();
+    let projected = per_layer_proj.matmul(&gated, n_tokens)?;
+    let normed = rms_norm_batch(
+        &projected,
+        n_tokens,
+        width,
+        Some(&per_layer_post_norm),
+        config.eps,
+    );
+    for (value, add) in cur.iter_mut().zip(&normed) {
+        *value += add;
+    }
+    for value in &mut cur {
+        *value *= out_scale;
+    }
+
+    Ok(cur)
 }

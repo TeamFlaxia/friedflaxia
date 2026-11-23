@@ -6,7 +6,7 @@
 
 use super::ModelError;
 use crate::gguf::{Gguf, ModelConfig};
-use crate::ops::{rms_norm, rope_neox_yarn_inplace, silu, softmax_in_place};
+use crate::ops::{rms_norm, rms_norm_batch, rope_neox_yarn_inplace, silu, softmax_in_place};
 use crate::tensor::tensor;
 
 #[derive(Debug, Clone)]
@@ -136,15 +136,45 @@ impl<'a> PlamoSession<'a> {
     }
 
     /// Feed every prompt token and return the final token's logits.
+    ///
+    /// The whole prompt goes through each projection as one batch, so the
+    /// weight matrices are streamed once per 16-token tile instead of once per
+    /// token.
     pub fn prefill(&mut self, token_ids: &[u32]) -> Result<Vec<f32>, ModelError> {
         if token_ids.is_empty() {
             return Err(ModelError::Invalid("token_ids must not be empty"));
         }
-        let mut logits = Vec::new();
+        let n_tokens = token_ids.len();
+        let width = self.config.n_embd;
+        let token_embd = tensor(self.gguf, self.file, "token_embd.weight")?;
+        let mut hidden = Vec::with_capacity(n_tokens * width);
         for token in token_ids {
-            logits = self.step(*token)?;
+            hidden.extend_from_slice(&token_embd.row_vec(*token as usize)?);
         }
-        Ok(logits)
+
+        let base_pos = self.pos;
+        for layer in 0..self.config.n_layer {
+            let cache = &mut self.layers[layer];
+            hidden = run_layer(
+                self.gguf,
+                self.file,
+                &self.config,
+                layer,
+                &hidden,
+                n_tokens,
+                &mut cache.keys,
+                &mut cache.values,
+                base_pos,
+            )?;
+        }
+        self.pos += n_tokens;
+
+        let last = &hidden[(n_tokens - 1) * width..];
+        let output_norm = tensor(self.gguf, self.file, "output_norm.weight")?.vec()?;
+        let normed = rms_norm(last, Some(&output_norm), self.config.eps);
+        tensor(self.gguf, self.file, "output.weight")?
+            .matvec(&normed)
+            .map_err(Into::into)
     }
 
     /// Decode one token and return its logits.
@@ -153,175 +183,30 @@ impl<'a> PlamoSession<'a> {
     }
 
     fn step(&mut self, token: u32) -> Result<Vec<f32>, ModelError> {
+        let width = self.config.n_embd;
         let token_embd = tensor(self.gguf, self.file, "token_embd.weight")?;
         let mut hidden = token_embd.row_vec(token as usize)?;
-        let position = self.pos;
+        let base_pos = self.pos;
 
         for layer in 0..self.config.n_layer {
-            let prefix = format!("blk.{layer}");
-            let attn_norm =
-                tensor(self.gguf, self.file, &format!("{prefix}.attn_norm.weight"))?.vec()?;
-            let wqkv = tensor(self.gguf, self.file, &format!("{prefix}.attn_qkv.weight"))?;
-            let q_norm = tensor(
+            let cache = &mut self.layers[layer];
+            hidden = run_layer(
                 self.gguf,
                 self.file,
-                &format!("{prefix}.attn_q_norm.weight"),
-            )?
-            .vec()?;
-            let k_norm = tensor(
-                self.gguf,
-                self.file,
-                &format!("{prefix}.attn_k_norm.weight"),
-            )?
-            .vec()?;
-            let wo = tensor(
-                self.gguf,
-                self.file,
-                &format!("{prefix}.attn_output.weight"),
+                &self.config,
+                layer,
+                &hidden,
+                1,
+                &mut cache.keys,
+                &mut cache.values,
+                base_pos,
             )?;
-            let attn_post_norm = tensor(
-                self.gguf,
-                self.file,
-                &format!("{prefix}.post_attention_norm"),
-            )?
-            .vec()?;
-            let ffn_norm =
-                tensor(self.gguf, self.file, &format!("{prefix}.ffn_norm.weight"))?.vec()?;
-            let ffn_up = tensor(self.gguf, self.file, &format!("{prefix}.ffn_up.weight"))?;
-            let ffn_down = tensor(self.gguf, self.file, &format!("{prefix}.ffn_down.weight"))?;
-            let ffn_post_norm =
-                tensor(self.gguf, self.file, &format!("{prefix}.post_ffw_norm"))?.vec()?;
-
-            let (freq_base, freq_scale, ext_factor, attn_factor) = if self.config.swa_pattern[layer]
-            {
-                (self.config.rope_freq_base_swa, 1.0, 0.0, 1.0)
-            } else {
-                (
-                    self.config.rope_freq_base,
-                    self.config.rope_freq_scale,
-                    self.config.yarn_ext_factor,
-                    self.config.yarn_attn_factor,
-                )
-            };
-
-            let normed = rms_norm(&hidden, Some(&attn_norm), self.config.eps);
-            let qkv = wqkv.matvec(&normed)?;
-            let q_dim = self.config.n_head * self.config.head_dim;
-            let k_dim = self.config.n_head_kv * self.config.head_dim;
-            if qkv.len() != q_dim + k_dim + k_dim {
-                return Err(ModelError::Shape(format!("{prefix} qkv dimension")));
-            }
-            let mut q = qkv[..q_dim].to_vec();
-            let mut k = qkv[q_dim..q_dim + k_dim].to_vec();
-            let v = qkv[q_dim + k_dim..].to_vec();
-
-            for head in 0..self.config.n_head {
-                let start = head * self.config.head_dim;
-                let value = rms_norm(
-                    &q[start..start + self.config.head_dim],
-                    Some(&q_norm),
-                    self.config.eps,
-                );
-                q[start..start + self.config.head_dim].copy_from_slice(&value);
-            }
-            for head in 0..self.config.n_head_kv {
-                let start = head * self.config.head_dim;
-                let value = rms_norm(
-                    &k[start..start + self.config.head_dim],
-                    Some(&k_norm),
-                    self.config.eps,
-                );
-                k[start..start + self.config.head_dim].copy_from_slice(&value);
-            }
-
-            rope_neox_yarn_inplace(
-                &mut q,
-                self.config.n_head,
-                self.config.head_dim,
-                position,
-                freq_base,
-                freq_scale,
-                ext_factor,
-                attn_factor,
-                self.config.yarn_beta_fast,
-                self.config.yarn_beta_slow,
-                self.config.n_ctx_orig,
-            );
-            rope_neox_yarn_inplace(
-                &mut k,
-                self.config.n_head_kv,
-                self.config.head_dim,
-                position,
-                freq_base,
-                freq_scale,
-                ext_factor,
-                attn_factor,
-                self.config.yarn_beta_fast,
-                self.config.yarn_beta_slow,
-                self.config.n_ctx_orig,
-            );
-
-            self.layers[layer].keys.push(k);
-            self.layers[layer].values.push(v);
-
-            let start = if self.config.swa_pattern[layer] && self.config.n_swa > 0 {
-                position.saturating_sub(self.config.n_swa - 1)
-            } else {
-                0
-            };
-            let keys = &self.layers[layer].keys;
-            let values = &self.layers[layer].values;
-            let mut concat = vec![0.0f32; q_dim];
-            for head in 0..self.config.n_head {
-                let kv_head = head / (self.config.n_head / self.config.n_head_kv);
-                let mut scores: Vec<f32> = (start..=position)
-                    .map(|other| {
-                        q[head * self.config.head_dim..(head + 1) * self.config.head_dim]
-                            .iter()
-                            .zip(
-                                &keys[other][kv_head * self.config.head_dim
-                                    ..(kv_head + 1) * self.config.head_dim],
-                            )
-                            .map(|(q, k)| q * k)
-                            .sum::<f32>()
-                            / (self.config.head_dim as f32).sqrt()
-                    })
-                    .collect();
-                softmax_in_place(&mut scores);
-                let dest =
-                    &mut concat[head * self.config.head_dim..(head + 1) * self.config.head_dim];
-                for (weight, other) in scores.iter().zip(start..=position) {
-                    for (index, value) in values[other]
-                        [kv_head * self.config.head_dim..(kv_head + 1) * self.config.head_dim]
-                        .iter()
-                        .enumerate()
-                    {
-                        dest[index] += weight * value;
-                    }
-                }
-            }
-            let projected = wo.matvec(&concat)?;
-            let post = rms_norm(&projected, Some(&attn_post_norm), self.config.eps);
-            let residual = add(&hidden, &post);
-
-            let ffn_in = rms_norm(&residual, Some(&ffn_norm), self.config.eps);
-            let up = ffn_up.matvec(&ffn_in)?;
-            if up.len() != 2 * self.config.n_ff {
-                return Err(ModelError::Shape(format!("{prefix} ffn_up dimension")));
-            }
-            let activated: Vec<f32> = up[..self.config.n_ff]
-                .iter()
-                .zip(&up[self.config.n_ff..])
-                .map(|(gate, up)| silu(*gate) * up)
-                .collect();
-            let down = ffn_down.matvec(&activated)?;
-            let post = rms_norm(&down, Some(&ffn_post_norm), self.config.eps);
-            hidden = add(&residual, &post);
         }
 
         self.pos += 1;
         let output_norm = tensor(self.gguf, self.file, "output_norm.weight")?.vec()?;
-        let normed = rms_norm(&hidden, Some(&output_norm), self.config.eps);
+        debug_assert_eq!(hidden.len(), width);
+        let normed = rms_norm(&hidden[..width], Some(&output_norm), self.config.eps);
         tensor(self.gguf, self.file, "output.weight")?
             .matvec(&normed)
             .map_err(Into::into)
@@ -352,9 +237,9 @@ pub fn last_token_logits(
     }
     let config = PlamoConfig::from_gguf(gguf)?;
     let hidden = forward_hidden(gguf, file, &config, token_ids)?;
-    let last = hidden
-        .last()
-        .ok_or_else(|| ModelError::Shape("empty hidden state".into()))?;
+    let width = config.n_embd;
+    let last_start = (token_ids.len() - 1) * width;
+    let last = &hidden[last_start..last_start + width];
     let output_norm = tensor(gguf, file, "output_norm.weight")?.vec()?;
     let normed = rms_norm(last, Some(&output_norm), config.eps);
     let output = tensor(gguf, file, "output.weight")?;
@@ -366,183 +251,242 @@ fn forward_hidden(
     file: &[u8],
     config: &PlamoConfig,
     token_ids: &[u32],
-) -> Result<Vec<Vec<f32>>, ModelError> {
+) -> Result<Vec<f32>, ModelError> {
     forward_hidden_until(gguf, file, config, token_ids, config.n_layer)
 }
 
+/// Run the decoder stack over a whole prompt, returning flat
+/// `[n_tokens][n_embd]` hidden states.
 fn forward_hidden_until(
     gguf: &Gguf,
     file: &[u8],
     config: &PlamoConfig,
     token_ids: &[u32],
     layers: usize,
-) -> Result<Vec<Vec<f32>>, ModelError> {
+) -> Result<Vec<f32>, ModelError> {
+    let width = config.n_embd;
+    let n_tokens = token_ids.len();
     let token_embd = tensor(gguf, file, "token_embd.weight")?;
-    let mut hidden: Vec<Vec<f32>> = token_ids
-        .iter()
-        .map(|id| token_embd.row_vec(*id as usize))
-        .collect::<Result<_, _>>()?;
+    let mut hidden = Vec::with_capacity(n_tokens * width);
+    for id in token_ids {
+        hidden.extend_from_slice(&token_embd.row_vec(*id as usize)?);
+    }
 
     for layer in 0..layers.min(config.n_layer) {
-        let prefix = format!("blk.{layer}");
-        let attn_norm = tensor(gguf, file, &format!("{prefix}.attn_norm.weight"))?.vec()?;
-        let wqkv = tensor(gguf, file, &format!("{prefix}.attn_qkv.weight"))?;
-        let q_norm = tensor(gguf, file, &format!("{prefix}.attn_q_norm.weight"))?.vec()?;
-        let k_norm = tensor(gguf, file, &format!("{prefix}.attn_k_norm.weight"))?.vec()?;
-        let wo = tensor(gguf, file, &format!("{prefix}.attn_output.weight"))?;
-        let attn_post_norm = tensor(gguf, file, &format!("{prefix}.post_attention_norm"))?.vec()?;
-        let ffn_norm = tensor(gguf, file, &format!("{prefix}.ffn_norm.weight"))?.vec()?;
-        let ffn_up = tensor(gguf, file, &format!("{prefix}.ffn_up.weight"))?;
-        let ffn_down = tensor(gguf, file, &format!("{prefix}.ffn_down.weight"))?;
-        let ffn_post_norm = tensor(gguf, file, &format!("{prefix}.post_ffw_norm"))?.vec()?;
-
-        let q_dim = config.n_head * config.head_dim;
-        let k_dim = config.n_head_kv * config.head_dim;
-        let v_dim = config.n_head_kv * config.head_dim;
-        let (freq_base, freq_scale, ext_factor, attn_factor) = if config.swa_pattern[layer] {
-            // PLaMO uses plain RoPE (theta 10000) on sliding-window layers;
-            // YaRN applies only to the full-attention layers.
-            (config.rope_freq_base_swa, 1.0, 0.0, 1.0)
-        } else {
-            (
-                config.rope_freq_base,
-                config.rope_freq_scale,
-                config.yarn_ext_factor,
-                config.yarn_attn_factor,
-            )
-        };
-        let window = config.swa_pattern[layer].then_some(config.n_swa);
-
-        let mut q_heads = Vec::with_capacity(hidden.len());
-        let mut k_heads = Vec::with_capacity(hidden.len());
-        let mut v_heads = Vec::with_capacity(hidden.len());
-        for (position, row) in hidden.iter().enumerate() {
-            let normed = rms_norm(row, Some(&attn_norm), config.eps);
-            let qkv = wqkv.matvec(&normed)?;
-            if qkv.len() != q_dim + k_dim + v_dim {
-                return Err(ModelError::Shape(format!("{prefix} qkv dimension")));
-            }
-            let mut q = qkv[..q_dim].to_vec();
-            let mut k = qkv[q_dim..q_dim + k_dim].to_vec();
-            let v = qkv[q_dim + k_dim..].to_vec();
-
-            for head in 0..config.n_head {
-                let start = head * config.head_dim;
-                let value = rms_norm(
-                    &q[start..start + config.head_dim],
-                    Some(&q_norm),
-                    config.eps,
-                );
-                q[start..start + config.head_dim].copy_from_slice(&value);
-            }
-            for head in 0..config.n_head_kv {
-                let start = head * config.head_dim;
-                let value = rms_norm(
-                    &k[start..start + config.head_dim],
-                    Some(&k_norm),
-                    config.eps,
-                );
-                k[start..start + config.head_dim].copy_from_slice(&value);
-            }
-
-            rope_neox_yarn_inplace(
-                &mut q,
-                config.n_head,
-                config.head_dim,
-                position,
-                freq_base,
-                freq_scale,
-                ext_factor,
-                attn_factor,
-                config.yarn_beta_fast,
-                config.yarn_beta_slow,
-                config.n_ctx_orig,
-            );
-            rope_neox_yarn_inplace(
-                &mut k,
-                config.n_head_kv,
-                config.head_dim,
-                position,
-                freq_base,
-                freq_scale,
-                ext_factor,
-                attn_factor,
-                config.yarn_beta_fast,
-                config.yarn_beta_slow,
-                config.n_ctx_orig,
-            );
-
-            q_heads.push(
-                (0..config.n_head)
-                    .map(|head| q[head * config.head_dim..(head + 1) * config.head_dim].to_vec())
-                    .collect::<Vec<_>>(),
-            );
-            k_heads.push(
-                (0..config.n_head_kv)
-                    .map(|head| k[head * config.head_dim..(head + 1) * config.head_dim].to_vec())
-                    .collect::<Vec<_>>(),
-            );
-            v_heads.push(
-                (0..config.n_head_kv)
-                    .map(|head| v[head * config.head_dim..(head + 1) * config.head_dim].to_vec())
-                    .collect::<Vec<_>>(),
-            );
-        }
-
-        let mut next = Vec::with_capacity(hidden.len());
-        for token in 0..hidden.len() {
-            let start = match window {
-                Some(window) => token.saturating_sub(window.saturating_sub(1)),
-                None => 0,
-            };
-            let mut concat = vec![0.0f32; q_dim];
-            for head in 0..config.n_head {
-                let kv_head = head / (config.n_head / config.n_head_kv);
-                let mut scores: Vec<f32> = (start..=token)
-                    .map(|other| {
-                        q_heads[token][head]
-                            .iter()
-                            .zip(&k_heads[other][kv_head])
-                            .map(|(q, k)| q * k)
-                            .sum::<f32>()
-                            / (config.head_dim as f32).sqrt()
-                    })
-                    .collect();
-                softmax_in_place(&mut scores);
-                let dest = &mut concat[head * config.head_dim..(head + 1) * config.head_dim];
-                for (weight, other) in scores.iter().zip(start..=token) {
-                    for (index, value) in v_heads[other][kv_head].iter().enumerate() {
-                        dest[index] += weight * value;
-                    }
-                }
-            }
-            let projected = wo.matvec(&concat)?;
-            let post = rms_norm(&projected, Some(&attn_post_norm), config.eps);
-            let residual = add(&hidden[token], &post);
-
-            let ffn_in = rms_norm(&residual, Some(&ffn_norm), config.eps);
-            let up = ffn_up.matvec(&ffn_in)?;
-            if up.len() != 2 * config.n_ff {
-                return Err(ModelError::Shape(format!("{prefix} ffn_up dimension")));
-            }
-            let activated: Vec<f32> = up[..config.n_ff]
-                .iter()
-                .zip(&up[config.n_ff..])
-                .map(|(gate, up)| silu(*gate) * up)
-                .collect();
-            let down = ffn_down.matvec(&activated)?;
-            let post = rms_norm(&down, Some(&ffn_post_norm), config.eps);
-            next.push(add(&residual, &post));
-        }
-        hidden = next;
+        let mut keys = Vec::new();
+        let mut values = Vec::new();
+        hidden = run_layer(
+            gguf,
+            file,
+            config,
+            layer,
+            &hidden,
+            n_tokens,
+            &mut keys,
+            &mut values,
+            0,
+        )?;
     }
 
     Ok(hidden)
 }
 
-fn add(left: &[f32], right: &[f32]) -> Vec<f32> {
-    left.iter()
-        .zip(right)
-        .map(|(left, right)| left + right)
-        .collect()
+/// One decoder layer for `n_tokens` positions, appending the KV cache entries.
+///
+/// With `n_tokens == 1` every projection falls back to the single-token kernel,
+/// so decode stays numerically identical to the pre-batching implementation.
+#[allow(clippy::too_many_arguments)]
+fn run_layer(
+    gguf: &Gguf,
+    file: &[u8],
+    config: &PlamoConfig,
+    layer: usize,
+    hidden: &[f32],
+    n_tokens: usize,
+    keys: &mut Vec<Vec<f32>>,
+    values: &mut Vec<Vec<f32>>,
+    base_pos: usize,
+) -> Result<Vec<f32>, ModelError> {
+    let prefix = format!("blk.{layer}");
+    let attn_norm = tensor(gguf, file, &format!("{prefix}.attn_norm.weight"))?.vec()?;
+    let wqkv = tensor(gguf, file, &format!("{prefix}.attn_qkv.weight"))?;
+    let q_norm = tensor(gguf, file, &format!("{prefix}.attn_q_norm.weight"))?.vec()?;
+    let k_norm = tensor(gguf, file, &format!("{prefix}.attn_k_norm.weight"))?.vec()?;
+    let wo = tensor(gguf, file, &format!("{prefix}.attn_output.weight"))?;
+    let attn_post_norm = tensor(gguf, file, &format!("{prefix}.post_attention_norm"))?.vec()?;
+    let ffn_norm = tensor(gguf, file, &format!("{prefix}.ffn_norm.weight"))?.vec()?;
+    let ffn_up = tensor(gguf, file, &format!("{prefix}.ffn_up.weight"))?;
+    let ffn_down = tensor(gguf, file, &format!("{prefix}.ffn_down.weight"))?;
+    let ffn_post_norm = tensor(gguf, file, &format!("{prefix}.post_ffw_norm"))?.vec()?;
+
+    let width = config.n_embd;
+    if hidden.len() != n_tokens * width {
+        return Err(ModelError::Shape(format!("{prefix} hidden shape")));
+    }
+    // A failed prefill can leave entries behind without advancing the session;
+    // reject that state instead of appending duplicates.
+    if keys.len() != base_pos || values.len() != base_pos {
+        return Err(ModelError::Shape(format!(
+            "{prefix} attention cache length"
+        )));
+    }
+    let q_dim = config.n_head * config.head_dim;
+    let k_dim = config.n_head_kv * config.head_dim;
+    let v_dim = config.n_head_kv * config.head_dim;
+    let qkv_dim = q_dim + k_dim + v_dim;
+    let (freq_base, freq_scale, ext_factor, attn_factor) = if config.swa_pattern[layer] {
+        // PLaMO uses plain RoPE (theta 10000) on sliding-window layers;
+        // YaRN applies only to the full-attention layers.
+        (config.rope_freq_base_swa, 1.0, 0.0, 1.0)
+    } else {
+        (
+            config.rope_freq_base,
+            config.rope_freq_scale,
+            config.yarn_ext_factor,
+            config.yarn_attn_factor,
+        )
+    };
+    let window = config.swa_pattern[layer].then_some(config.n_swa);
+    if wo.rows() != width || wo.cols() != q_dim {
+        return Err(ModelError::Shape(format!(
+            "{prefix} attention output shape"
+        )));
+    }
+    if ffn_down.rows() != width || ffn_down.cols() != config.n_ff {
+        return Err(ModelError::Shape(format!("{prefix} ffn_down shape")));
+    }
+
+    let normed = rms_norm_batch(hidden, n_tokens, width, Some(&attn_norm), config.eps);
+    let mut qkv = wqkv.matmul(&normed, n_tokens)?;
+    drop(normed);
+    if qkv.len() != n_tokens * qkv_dim {
+        return Err(ModelError::Shape(format!("{prefix} qkv dimension")));
+    }
+
+    for token in 0..n_tokens {
+        let position = base_pos + token;
+        let row = &mut qkv[token * qkv_dim..(token + 1) * qkv_dim];
+        let (q, rest) = row.split_at_mut(q_dim);
+        let (k, v) = rest.split_at_mut(k_dim);
+
+        for head in 0..config.n_head {
+            let start = head * config.head_dim;
+            let value = rms_norm(
+                &q[start..start + config.head_dim],
+                Some(&q_norm),
+                config.eps,
+            );
+            q[start..start + config.head_dim].copy_from_slice(&value);
+        }
+        for head in 0..config.n_head_kv {
+            let start = head * config.head_dim;
+            let value = rms_norm(
+                &k[start..start + config.head_dim],
+                Some(&k_norm),
+                config.eps,
+            );
+            k[start..start + config.head_dim].copy_from_slice(&value);
+        }
+
+        rope_neox_yarn_inplace(
+            q,
+            config.n_head,
+            config.head_dim,
+            position,
+            freq_base,
+            freq_scale,
+            ext_factor,
+            attn_factor,
+            config.yarn_beta_fast,
+            config.yarn_beta_slow,
+            config.n_ctx_orig,
+        );
+        rope_neox_yarn_inplace(
+            k,
+            config.n_head_kv,
+            config.head_dim,
+            position,
+            freq_base,
+            freq_scale,
+            ext_factor,
+            attn_factor,
+            config.yarn_beta_fast,
+            config.yarn_beta_slow,
+            config.n_ctx_orig,
+        );
+
+        keys.push(k.to_vec());
+        values.push(v.to_vec());
+    }
+
+    let softmax_scale = 1.0 / (config.head_dim as f32).sqrt();
+    let mut concat = vec![0.0f32; n_tokens * q_dim];
+    let mut scores: Vec<f32> = Vec::new();
+    for token in 0..n_tokens {
+        let position = base_pos + token;
+        let start = match window {
+            Some(window) if window > 0 => position.saturating_sub(window - 1),
+            _ => 0,
+        };
+        if keys.len() < position + 1 || values.len() != keys.len() {
+            return Err(ModelError::Shape(format!("{prefix} attention cache")));
+        }
+        let q_row = &qkv[token * qkv_dim..token * qkv_dim + q_dim];
+        for head in 0..config.n_head {
+            let kv_head = head / (config.n_head / config.n_head_kv);
+            let q_head = &q_row[head * config.head_dim..(head + 1) * config.head_dim];
+            scores.clear();
+            scores.extend((start..=position).map(|other| {
+                let key = &keys[other][kv_head * config.head_dim..(kv_head + 1) * config.head_dim];
+                q_head.iter().zip(key).map(|(q, k)| q * k).sum::<f32>() * softmax_scale
+            }));
+            softmax_in_place(&mut scores);
+            let dest = &mut concat[token * q_dim + head * config.head_dim
+                ..token * q_dim + (head + 1) * config.head_dim];
+            for (weight, other) in scores.iter().zip(start..=position) {
+                let value =
+                    &values[other][kv_head * config.head_dim..(kv_head + 1) * config.head_dim];
+                for (index, value) in value.iter().enumerate() {
+                    dest[index] += weight * value;
+                }
+            }
+        }
+    }
+
+    let projected = wo.matmul(&concat, n_tokens)?;
+    let post = rms_norm_batch(
+        &projected,
+        n_tokens,
+        width,
+        Some(&attn_post_norm),
+        config.eps,
+    );
+    let residual: Vec<f32> = hidden
+        .iter()
+        .zip(&post)
+        .map(|(residual, value)| residual + value)
+        .collect();
+
+    let ffn_in = rms_norm_batch(&residual, n_tokens, width, Some(&ffn_norm), config.eps);
+    let up = ffn_up.matmul(&ffn_in, n_tokens)?;
+    if up.len() != n_tokens * 2 * config.n_ff {
+        return Err(ModelError::Shape(format!("{prefix} ffn_up dimension")));
+    }
+    let mut activated = vec![0.0f32; n_tokens * config.n_ff];
+    let row_stride = 2 * config.n_ff;
+    for token in 0..n_tokens {
+        let row = &up[token * row_stride..(token + 1) * row_stride];
+        let dest = &mut activated[token * config.n_ff..(token + 1) * config.n_ff];
+        for (index, value) in dest.iter_mut().enumerate() {
+            *value = silu(row[index]) * row[config.n_ff + index];
+        }
+    }
+    let down = ffn_down.matmul(&activated, n_tokens)?;
+    let post = rms_norm_batch(&down, n_tokens, width, Some(&ffn_post_norm), config.eps);
+
+    Ok(residual
+        .iter()
+        .zip(&post)
+        .map(|(residual, value)| residual + value)
+        .collect())
 }

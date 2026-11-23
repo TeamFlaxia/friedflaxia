@@ -54,3 +54,43 @@ fn embeddinggemma_matches_onnx_golden() {
         "max absolute difference {max_abs} is too high (cosine {cosine})"
     );
 }
+
+/// Scaling check for the batched forward pass. The old per-token path streamed
+/// the whole Q8_0 matrix once per token, so 256 tokens cost ~256 passes; with
+/// the batched kernels the weight matrix is streamed once per layer tile.
+#[test]
+#[ignore = "requires FRIEDFLAXIA_EMBED_GEMMA_GGUF; prints timings"]
+fn embeddinggemma_batched_long_sequence_timing() {
+    let path = env::var("FRIEDFLAXIA_EMBED_GEMMA_GGUF").expect("set FRIEDFLAXIA_EMBED_GEMMA_GGUF");
+    let file = fs::read(path).expect("read EmbeddingGemma GGUF");
+    let gguf = Gguf::parse_with_options(
+        &file,
+        ParseOptions {
+            skip_tokenizer: true,
+        },
+    )
+    .expect("parse EmbeddingGemma GGUF");
+
+    let short = TOKEN_IDS;
+    let started = std::time::Instant::now();
+    embed_text(&gguf, &file, &short).expect("short embed");
+    println!(
+        "tokens={} time_ms={}",
+        short.len(),
+        started.elapsed().as_millis()
+    );
+
+    for tokens in [64usize, 256] {
+        let ids: Vec<u32> = (0..tokens)
+            .map(|index| TOKEN_IDS[1 + index % (TOKEN_IDS.len() - 2)])
+            .collect();
+        let started = std::time::Instant::now();
+        embed_text(&gguf, &file, &ids).expect("long embed");
+        println!(
+            "tokens={} time_ms={} ms_per_token={:.2}",
+            tokens,
+            started.elapsed().as_millis(),
+            started.elapsed().as_secs_f64() * 1000.0 / tokens as f64
+        );
+    }
+}
