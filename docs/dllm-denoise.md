@@ -113,6 +113,23 @@ A real-model smoke test is available behind
 cargo test --release --test dllm -- --ignored --nocapture
 ```
 
+### Converted validation model
+
+The 0.6B BD3LM validation checkpoint is converted and pinned in
+`model-manifest.json` as `dllm`:
+
+```text
+RemydreScarlet/qwen3-0.6B-diffusion-bd3lm-GGUF  (Q4_0, 342 MB)
+sha256 fde85413e94a93bb7dd8f1c738395ef82359a3c59b9ef286b2ff87c9805460a3
+```
+
+`tools/convert_dllm.py` maps the upstream `a2d-qwen3` safetensors to the
+`qwen3-dllm` GGUF layout (Q8_0 or Q4_0), including the Qwen3 tokenizer. The
+`qwen3` BPE mode splits every digit (`\p{N}`, not GPT-2's `\p{N}{1,3}`), which
+is required for a faithful Qwen tokenizer. Chat prompts are built from
+`<|im_start|>`/`<|im_end|>` ids plus `<|mask|>` (151669) for the response
+block. This is an algorithm-validation model, not a production chat model.
+
 ## Performance
 
 A denoise step is a full forward over the active block; a response costs
@@ -135,7 +152,9 @@ License safety comes first (avoid PolyForm Noncommercial):
 
 **Quantization:** the kernels cover F32, BF16, Q4_0, Q4_1, Q8_0 and Q6_K. A
 typical `Q4_K_M` conversion is not supported yet, so pin the converted dLLM GGUF
-to Q8_0 or Q4_0 (or add a Q4_K kernel before shipping it).
+to Q8_0 or Q4_0 (or add a Q4_K kernel before shipping it). The pinned validation
+artifact is Q4_0 (342 MB); the Q8_0 conversion (640 MB) is available from the
+same converter for quality comparisons.
 
 ## Related
 
