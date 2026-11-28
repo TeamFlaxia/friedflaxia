@@ -133,11 +133,7 @@ impl LoraPair {
     /// - `dA[i, r] = scale * (Bᵀ dout)[r] * x[i]`
     /// - `dB[r, o] = scale * dout[o] * (A x)[r]`
     /// - `dx[i]    = scale * Σ_r A[i, r] * (Bᵀ dout)[r]`
-    pub fn backward(
-        &self,
-        x: &[f32],
-        dout: &[f32],
-    ) -> Result<LoraGradients, GradError> {
+    pub fn backward(&self, x: &[f32], dout: &[f32]) -> Result<LoraGradients, GradError> {
         self.validate()?;
         check_len("x", self.in_dim, x.len())?;
         check_len("dout", self.out_dim, dout.len())?;
