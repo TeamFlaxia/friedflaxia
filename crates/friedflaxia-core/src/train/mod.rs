@@ -7,4 +7,5 @@
 pub mod es;
 pub mod lora_grad;
 pub mod lora_weights;
+pub mod optimizer;
 pub mod rng;
