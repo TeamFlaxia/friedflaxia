@@ -98,11 +98,11 @@ fn gguf_writer_round_trips_tensor_names_dims_offsets_and_values() {
     let b = gguf.tensor(B_NAME).expect("lora_b info");
     assert_eq!(b.dims, vec![4, 2]);
     assert_eq!(b.tensor_type, TensorType::F32);
-    assert_eq!(b.offset, 48); // 12 f32 values * 4 bytes
+    assert_eq!(b.offset, 64); // 12 f32 values * 4 bytes = 48, padded to 32-byte alignment
 
     assert_eq!(gguf.alignment(), ALIGNMENT as u64);
     assert_eq!(gguf.data_offset() % ALIGNMENT, 0);
-    assert_eq!(bytes.len(), gguf.data_offset() + 48 + 32);
+    assert_eq!(bytes.len(), gguf.data_offset() + 64 + 32);
 
     assert_f32_data(&bytes, &gguf, A_NAME, &a_values());
     assert_f32_data(&bytes, &gguf, B_NAME, &b_values());
@@ -331,13 +331,11 @@ fn gguf_writer_mixed_f32_and_q4_0_offsets_are_correct() {
     assert_eq!(gguf.tensor(A_NAME).unwrap().tensor_type, TensorType::F32);
     assert_eq!(gguf.tensor(A_NAME).unwrap().offset, 0);
     assert_eq!(gguf.tensor(Q4_NAME).unwrap().tensor_type, TensorType::Q4_0);
-    assert_eq!(gguf.tensor(Q4_NAME).unwrap().offset, 48);
+    assert_eq!(gguf.tensor(Q4_NAME).unwrap().offset, 64);
     assert_eq!(gguf.tensor(B_NAME).unwrap().tensor_type, TensorType::F32);
-    assert_eq!(
-        gguf.tensor(B_NAME).unwrap().offset,
-        48 + Q4_0_BLOCK_BYTES as u64
-    );
-    assert_eq!(bytes.len(), gguf.data_offset() + 48 + Q4_0_BLOCK_BYTES + 32);
+    // 64 (padded A) + 32 (18-byte Q4_0 block padded to 32).
+    assert_eq!(gguf.tensor(B_NAME).unwrap().offset, 96);
+    assert_eq!(bytes.len(), gguf.data_offset() + 128);
     assert_f32_data(&bytes, &gguf, A_NAME, &a_values());
     assert_f32_data(&bytes, &gguf, B_NAME, &b_values());
 }

@@ -170,6 +170,7 @@ impl Writer {
         Self::write_padding(&mut out);
         for tensor in &self.tensors {
             out.extend_from_slice(&tensor.data);
+            Self::write_padding(&mut out);
         }
         out
     }
@@ -188,6 +189,12 @@ impl Writer {
         }
     }
 
+    /// GGUF tensor offsets are the cumulative sum of *padded* tensor sizes.
+    /// llama.cpp rejects files that use raw byte lengths instead.
+    fn padded_len(len: usize) -> usize {
+        len.div_ceil(ALIGNMENT) * ALIGNMENT
+    }
+
     fn write_tensor_infos(&self, out: &mut Vec<u8>) {
         let mut offset = 0u64;
         for tensor in &self.tensors {
@@ -198,7 +205,7 @@ impl Writer {
             }
             put_u32(out, tensor.kind.tensor_type().as_u32());
             out.extend_from_slice(&offset.to_le_bytes());
-            offset += tensor.data.len() as u64;
+            offset += Self::padded_len(tensor.data.len()) as u64;
         }
     }
 
