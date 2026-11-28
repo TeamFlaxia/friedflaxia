@@ -4,7 +4,7 @@
 //! the WASM node keeps running forward-only. These helpers are used by the
 //! native `friedflaxia-train` CLI during off-time rounds.
 
-pub mod autograd;
 pub mod es;
+pub mod lora_grad;
 pub mod lora_weights;
 pub mod rng;
