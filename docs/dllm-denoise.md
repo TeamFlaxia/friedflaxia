@@ -5,8 +5,9 @@ nodes and merges their per-position token distributions. This note records the
 implemented FriedFlaxia extension and what is still missing.
 
 > Status: the qwen3-dllm forward pass, block attention mask, full-logit and
-> top-k APIs, LoRA adapters and the wasm bindings are implemented. A block/KV
-> cache and real-model parity are next.
+> top-k APIs, LoRA adapters, the wasm bindings, and the offline Rust training
+> CLI are implemented. A block/KV cache, real-model parity and a real LoRA
+> adapter pin are next.
 
 ## Implemented
 
@@ -77,6 +78,58 @@ and an adapter that matches no modules are rejected at load time. A zero
 model, and `loraRank`/`loraExpert` expose its identity for node reporting and
 delta attribution.
 
+## Offline training and the off-time policy
+
+**The production training path is Rust**: `friedflaxia-core` for GGUF IO and the
+adapter `Writer`, and `friedflaxia-train` for offline LoRA updates. The Python
+`tools/convert_dllm.py` converter and the upstream dLLM Python trainer
+(PEFT/SFT recipes) are **reference implementations only**, kept during the
+migration for validation and comparison. They are never called from a Crowd
+node or from Theia's inference path. See [tools/README.md](../tools/README.md)
+for the replacement status and compatibility constraints.
+
+Inference is forward-only. A node denoises with a pinned base dLLM plus a
+pinned expert adapter, reports scores and commit outcomes, and **never trains
+or mutates weights while serving**. Commit logs and cached activations are the
+training *input*, collected during inference and consumed later by a separate
+off-time job. The output is a new immutable adapter pin (`url` / `sha256` /
+`maxBytes` / `revision`), rolled out via canary with the previous pin kept for
+immediate rollback. This is the T5 (expert pin / capability) policy described
+in `theia/model-dev/research/06-offline-adapter-factory.md` and
+`flaxia-crowd/docs/theia-integration.md` in the sibling repositories.
+
+The native CLI (not part of the wasm build) is:
+
+```sh
+cargo run -p friedflaxia-train -- es-lora adapter.gguf round.json out.gguf
+cargo run -p friedflaxia-train -- sft     adapter.gguf round.json out.gguf
+cargo run -p friedflaxia-train -- grpo    adapter.gguf round.json out.gguf
+```
+
+- `es-lora`: evolution strategies over the LoRA A/B vector, driven by
+  `{"alpha": 0.01, "samples": [{"seed": 1, "reward": 0.7}]}`; no backward pass.
+- `sft`: cross-entropy on cached base-model hidden activations, driven by
+  `{"lr": 0.001, "examples": [{"x": [...], "logits": [...], "target": 0}]}`.
+- `grpo`: the same round format with `sampled` and `advantage` instead of
+  `target`; a zero advantage leaves the adapter byte-identical.
+
+`x` is a frozen hidden vector from a base-model forward (there is no autograd
+tape in the runtime), and `logits` are the cached output scores. The CLI only
+updates LoRA A/B tensors and re-serializes a loadable F32
+`qwen3-dllm-lora` GGUF through `crates/friedflaxia-core/src/gguf/writer.rs`; it
+does not run a base forward and never changes inference-time behavior. Run it
+as its own process on its own schedule, outside inference traffic.
+
+### Expert pin / capability status (T5 wiring)
+
+| Item | Status |
+|---|---|
+| `Model.withLora`, `loraRank()`, `loraExpert()` | implemented in Rust/wasm |
+| `THEIA_LORA_ADAPTERS` pins and `theia-expert-*` capability routing | implemented in Crowd |
+| LoRA adapter GGUF production (`qwen3-dllm-lora`) | implemented by the Rust `Writer` + train CLI |
+| Real LoRA GGUF artifact and actual pin values | **not configured yet** (only generated/synthetic adapters have been used) |
+| Block/KV cache, PyTorch logit parity | still open |
+
 ## Still missing
 
 1. **Block/KV cache.** The step already truncates the backbone at `end` and
@@ -130,7 +183,9 @@ sha256 0f13278bde4d700118c8cf13d293af897a8974e74293de887aa383c567352a8e
 matches control tokens such as `<|im_start|>`/`<|mask|>` verbatim before BPE,
 which Qwen prompts require. Input is assumed to be NFC-normalized. Chat prompts are built from
 `<|im_start|>`/`<|im_end|>` ids plus `<|mask|>` (151669) for the response
-block. This is an algorithm-validation model, not a production chat model.
+block. This is an algorithm-validation model, not a production chat model, and
+the converter is a **reference** tool: production artifacts follow the Rust path
+described above, with the Rust GGUF loader as the compatibility authority.
 
 ## Performance
 

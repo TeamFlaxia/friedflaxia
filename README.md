@@ -19,6 +19,24 @@ The initial target is the set of models Flaxia Crowd actually runs:
 
 Everything else in `ai-inference` is out of scope.
 
+## Production path vs reference tools
+
+**Production path = Rust: `friedflaxia-core` (GGUF/tokenizer/model IO and the
+forward pass) and `friedflaxia-train` (offline LoRA updates).** The Python
+scripts under `tools/` — `tools/convert_dllm.py` in particular — and the
+upstream dLLM Python trainer (PEFT/SFT recipes) are **reference implementations
+only**. They document the checkpoint mapping and the training algorithm, and
+are kept for validation during the migration; they are not part of the shipped
+runtime, are not called by Crowd nodes or Theia, and must not be treated as the
+source of truth for artifacts. See [tools/README.md](tools/README.md) for the
+replacement status and compatibility notes.
+
+Training is off-time only: the inference path stays forward-only and never
+updates model weights. `friedflaxia-train` is a separate native CLI that reads
+an existing LoRA adapter plus a round file and writes a new adapter GGUF via the
+Rust `Writer`; the result is distributed as a new immutable pin. See
+[docs/dllm-denoise.md](docs/dllm-denoise.md#offline-training-and-the-off-time-policy).
+
 ## Principles
 
 - **GGUF is the weight container.** No custom weight format.
@@ -88,6 +106,9 @@ Additionally:
   prefill passes
 - `qwen3-dllm` masked-diffusion denoise step (block attention mask, full logits
   or top-k candidates, LoRA adapters, wasm bindings)
+- `qwen3-dllm-lora` adapter loading (`Model.withLora`) and a Rust GGUF `Writer`
+  + offline `friedflaxia-train` CLI (`es-lora` / `sft` / `grpo`) for adapter
+  updates
 - wasm-bindgen package (`friedflaxia-wasm`) with `Model`, `MultimodalModel`
   and `D1MultimodalModel`
 - Node smoke test against the real Q8_0 model
@@ -118,9 +139,13 @@ Next slices:
 
 Theia runs small masked-diffusion LMs across Crowd nodes and merges their
 per-position token distributions. The implemented `denoise_step` / `denoise_topk`
-API, the block attention mask, and the remaining work (LoRA adapters, block/KV
-cache, real-model parity) are documented in
-[docs/dllm-denoise.md](docs/dllm-denoise.md).
+API, the block attention mask, the implemented LoRA adapter path
+(`Model.withLora`, Crowd adapter pins and `theia-expert-*` capability wiring),
+and the remaining work (block/KV cache, real-model parity, a real LoRA pin) are
+documented in [docs/dllm-denoise.md](docs/dllm-denoise.md). The offline training
+CLI and the "no learning during inference" policy are described in the same
+note. The Rust `Writer` now produces loadable `qwen3-dllm-lora` GGUFs, so the
+Python converter and Python trainer remain reference material only.
 
 ## wasm
 
