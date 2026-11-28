@@ -980,6 +980,66 @@ fn real_dllm_denoise_smoke() {
     );
 }
 
+#[test]
+#[ignore = "requires FRIEDFLAXIA_DLLM_GGUF pointing at a qwen3-dllm GGUF"]
+fn real_dllm_cache_matches_uncached_q4_0() {
+    let Ok(path) = std::env::var("FRIEDFLAXIA_DLLM_GGUF") else {
+        eprintln!("skipping: FRIEDFLAXIA_DLLM_GGUF is not set");
+        return;
+    };
+    let bytes = std::fs::read(path).expect("read dLLM GGUF");
+    let gguf = Gguf::parse(&bytes).expect("parse dLLM GGUF");
+    let config = DllmConfig::from_gguf(&gguf).expect("config");
+
+    let mut tokens = vec![1u32; 12];
+    tokens[0] = 151_644;
+    tokens[1] = 872;
+    tokens[2] = 151_645;
+    tokens[3] = 151_669;
+
+    let mut session = DllmSession::new(&gguf, &bytes).expect("session");
+    let steps = [((0, 8), vec![4, 5, 6]), ((4, 12), vec![8, 9, 10])];
+    for (index, (block, positions)) in steps.into_iter().enumerate() {
+        if index == 1 {
+            // Simulate the host committing new tokens into the former block.
+            for (offset, token) in [12138u32, 525, 151_669, 774].into_iter().enumerate() {
+                tokens[4 + offset] = token;
+            }
+        }
+        let expected = denoise_step(&gguf, &bytes, &tokens, &positions, block).expect("oracle");
+        let actual = session
+            .denoise_step(&tokens, &positions, block)
+            .expect("cached");
+        assert_eq!(actual.positions, expected.positions);
+        assert_eq!(actual.vocab_size, config.vocab_size);
+        // Q4_0 kernels can differ by a few ULPs depending on the batch shape.
+        for (position, (left, right)) in actual
+            .logits
+            .chunks_exact(config.vocab_size)
+            .zip(expected.logits.chunks_exact(config.vocab_size))
+            .enumerate()
+        {
+            let mut max_delta = 0.0f32;
+            for (a, b) in left.iter().zip(right) {
+                max_delta = max_delta.max((a - b).abs());
+                assert!(a.is_finite() && b.is_finite(), "non-finite logit");
+            }
+            assert!(
+                max_delta < 1e-3,
+                "step {index} position {}: max logit delta {max_delta}",
+                positions[position]
+            );
+        }
+
+        let expected_top =
+            denoise_topk(&gguf, &bytes, &tokens, &positions, block, 8).expect("oracle");
+        let actual_top = session
+            .denoise_topk(&tokens, &positions, block, 8)
+            .expect("cached");
+        assert_eq!(actual_top.token_ids, expected_top.token_ids);
+    }
+}
+
 // No .gguf base model is checked in under tests/fixtures (only binary golden
 // outputs are). The hidden-state tests therefore build tiny F32 GGUF mock
 // models in memory with the helpers above; `real_dllm_hidden_at_smoke` below

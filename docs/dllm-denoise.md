@@ -239,6 +239,26 @@ A denoise step is a full forward over the active block; a response costs
 3. Use the existing batched quantized matmul, then wasm SIMD / native threads,
    and finally `wgpu` if the step is still short.
 
+### Native measurement
+
+`crates/friedflaxia-core/examples/dllm_bench.rs` walks an eight-position block
+across a 64-token canvas, runs the free function and `DllmSession` on the same
+inputs, asserts identical top-8 candidates on every step, and prints per-step
+timings:
+
+```sh
+FRIEDFLAXIA_DLLM_GGUF=/path/to/qwen3-bd3lm-q4_0.gguf \
+  cargo run --release --example dllm_bench
+```
+
+On this host (release profile, pinned Q4_0 0.6B model, eight scored positions
+per step) the eight steps took 27.3 s uncached vs 12.6 s cached, **2.17x**,
+with the gap widening from step 2 onward as the committed prefix grows. Both
+paths re-read the GGUF layer tensors on every call, so the remaining floor is
+weight streaming; caching removes the prefix projections/norms/FFN, not the
+attention over cached prefix keys. These are absolute timings for this machine
+only — re-run on the target hardware before sizing a 4B model.
+
 ## Model candidates
 
 License safety comes first (avoid PolyForm Noncommercial):
