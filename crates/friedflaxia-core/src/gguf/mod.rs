@@ -12,6 +12,7 @@ mod value;
 
 pub mod config;
 pub mod tokenizer;
+pub mod writer;
 pub use config::{ConfigError, ModelConfig};
 pub use value::{TensorType, Value};
 
