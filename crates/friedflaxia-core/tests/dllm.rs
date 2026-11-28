@@ -1,9 +1,11 @@
 use friedflaxia_core::gguf::{Gguf, TensorType};
 use friedflaxia_core::models::dllm::{
-    DllmConfig, DllmModel, denoise_step, denoise_step_with_lora, denoise_topk,
-    denoise_topk_with_lora, hidden_at, hidden_at_with_lora,
+    DenoiseStepOutput, DenoiseTopKOutput, DllmConfig, DllmModel, DllmSession, denoise_step,
+    denoise_step_with_lora, denoise_topk, denoise_topk_with_lora, hidden_at, hidden_at_with_lora,
 };
 use friedflaxia_core::models::lora::{LoraModel, LoraModule};
+use friedflaxia_core::simd;
+use std::sync::Mutex;
 
 const ALIGNMENT: usize = 32;
 const GGUF_VERSION: u32 = 3;
@@ -1108,4 +1110,390 @@ fn real_dllm_hidden_at_smoke() {
     let hidden = hidden_at(&gguf, &bytes, &tokens, 0, 8, 7).expect("hidden");
     assert_eq!(hidden.len(), config.n_embd);
     assert!(hidden.iter().all(|value| value.is_finite()));
+}
+
+// ---------------------------------------------------------------------------
+// Block/KV prefix cache: differential tests against the uncached free oracle.
+// ---------------------------------------------------------------------------
+
+/// `simd::set_enabled` is process-global, so these tests must not overlap with
+/// each other (or with the SIMD parity tests in the same process).
+static CACHE_SIMD_LOCK: Mutex<()> = Mutex::new(());
+
+fn assert_bit_exact(a: &[f32], b: &[f32]) {
+    assert_eq!(a.len(), b.len());
+    for (index, (left, right)) in a.iter().zip(b).enumerate() {
+        assert_eq!(
+            left.to_bits(),
+            right.to_bits(),
+            "value {index} differs bit-exactly: {left} != {right}"
+        );
+    }
+}
+
+fn assert_step_exact(actual: &DenoiseStepOutput, expected: &DenoiseStepOutput) {
+    assert_eq!(actual.positions, expected.positions);
+    assert_eq!(actual.vocab_size, expected.vocab_size);
+    assert_bit_exact(&actual.logits, &expected.logits);
+    assert_bit_exact(&actual.confidence, &expected.confidence);
+}
+
+fn assert_topk_exact(actual: &DenoiseTopKOutput, expected: &DenoiseTopKOutput) {
+    assert_eq!(actual.positions, expected.positions);
+    assert_eq!(actual.vocab_size, expected.vocab_size);
+    assert_eq!(actual.top_k, expected.top_k);
+    assert_eq!(actual.token_ids, expected.token_ids);
+    assert_bit_exact(&actual.probabilities, &expected.probabilities);
+    assert_bit_exact(&actual.confidence, &expected.confidence);
+}
+
+#[test]
+fn session_empty_cache_matches_free_step_exactly() {
+    let bytes = build_model(false);
+    let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
+    let tokens = [1, 2, 3, 4];
+    let positions = [2, 3];
+    let block = (2, 4);
+
+    let expected = denoise_step(&gguf, &bytes, &tokens, &positions, block).expect("oracle");
+    let mut session = DllmSession::new(&gguf, &bytes).expect("session");
+    assert_eq!(session.prefix_len(), 0);
+    let actual = session
+        .denoise_step(&tokens, &positions, block)
+        .expect("cached");
+    assert_eq!(session.prefix_len(), 2);
+    assert_step_exact(&actual, &expected);
+
+    let expected_top = denoise_topk(&gguf, &bytes, &tokens, &positions, block, 3).expect("oracle");
+    let mut session = DllmSession::new(&gguf, &bytes).expect("session");
+    let actual_top = session
+        .denoise_topk(&tokens, &positions, block, 3)
+        .expect("cached");
+    assert_topk_exact(&actual_top, &expected_top);
+}
+
+#[test]
+fn session_warm_prefix_matches_free_step_exactly() {
+    let bytes = build_hardened_model();
+    let gguf = Gguf::parse(&bytes).expect("parse hardened dLLM");
+    let tokens = [1, 2, 3, 4, 0, 2];
+    let first_block = (2, 4);
+    let second_block = (2, 5);
+
+    let mut session = DllmSession::new(&gguf, &bytes).expect("session");
+    let first = session
+        .denoise_step(&tokens, &[2, 3], first_block)
+        .expect("first");
+    assert_eq!(session.prefix_len(), 2);
+    let first_oracle = denoise_step(&gguf, &bytes, &tokens, &[2, 3], first_block).expect("oracle");
+    assert_step_exact(&first, &first_oracle);
+
+    let positions = [2, 3, 4];
+    let actual = session
+        .denoise_step(&tokens, &positions, second_block)
+        .expect("warm");
+    let expected = denoise_step(&gguf, &bytes, &tokens, &positions, second_block).expect("oracle");
+    assert_eq!(session.prefix_len(), 2);
+    assert_step_exact(&actual, &expected);
+}
+
+#[test]
+fn session_gap_extension_matches_free_step_exactly() {
+    let bytes = build_hardened_model();
+    let gguf = Gguf::parse(&bytes).expect("parse hardened dLLM");
+    let tokens = [1, 2, 3, 4, 0, 1];
+    let mut session = DllmSession::new(&gguf, &bytes).expect("session");
+
+    session
+        .denoise_step(&tokens, &[1, 2], (1, 3))
+        .expect("first");
+    assert_eq!(session.prefix_len(), 1);
+
+    // The new block starts at 4, so rows [1..4) must be computed causally and
+    // committed before the next step can reuse them.
+    let positions = [3, 4, 5];
+    let actual = session
+        .denoise_step(&tokens, &positions, (4, 6))
+        .expect("gap");
+    let expected = denoise_step(&gguf, &bytes, &tokens, &positions, (4, 6)).expect("oracle");
+    assert_eq!(session.prefix_len(), 4);
+    assert_step_exact(&actual, &expected);
+}
+
+#[test]
+fn session_prefix_token_mutation_invalidates() {
+    let bytes = build_hardened_model();
+    let gguf = Gguf::parse(&bytes).expect("parse hardened dLLM");
+    let mut session = DllmSession::new(&gguf, &bytes).expect("session");
+    let mut tokens = [1, 2, 3, 4, 0, 1];
+    session
+        .denoise_step(&tokens, &[3, 4], (3, 5))
+        .expect("first");
+    assert_eq!(session.prefix_len(), 3);
+
+    tokens[1] = 2; // index 1 is a committed prefix position
+    let positions = [3, 4];
+    let actual = session
+        .denoise_step(&tokens, &positions, (3, 5))
+        .expect("mutated");
+    let expected = denoise_step(&gguf, &bytes, &tokens, &positions, (3, 5)).expect("oracle");
+    assert_step_exact(&actual, &expected);
+    assert_eq!(session.prefix_len(), 3);
+
+    // Changing a block token (still before block.1) needs no invalidation.
+    tokens[4] = 1;
+    let actual = session
+        .denoise_step(&tokens, &positions, (3, 5))
+        .expect("block token");
+    let expected = denoise_step(&gguf, &bytes, &tokens, &positions, (3, 5)).expect("oracle");
+    assert_step_exact(&actual, &expected);
+}
+
+#[test]
+fn session_backwards_block_invalidates() {
+    let bytes = build_hardened_model();
+    let gguf = Gguf::parse(&bytes).expect("parse hardened dLLM");
+    let tokens = [1, 2, 3, 4, 0, 1, 2, 3];
+    let mut session = DllmSession::new(&gguf, &bytes).expect("session");
+    session
+        .denoise_step(&tokens, &[4, 5], (4, 6))
+        .expect("first");
+    assert_eq!(session.prefix_len(), 4);
+
+    let positions = [2, 3, 4, 5];
+    let actual = session
+        .denoise_step(&tokens, &positions, (2, 6))
+        .expect("backwards");
+    let expected = denoise_step(&gguf, &bytes, &tokens, &positions, (2, 6)).expect("oracle");
+    assert_eq!(session.prefix_len(), 2);
+    assert_step_exact(&actual, &expected);
+}
+
+#[test]
+fn session_scores_prefix_positions_with_warm_cache() {
+    let bytes = build_hardened_model();
+    let gguf = Gguf::parse(&bytes).expect("parse hardened dLLM");
+    let tokens = [1, 2, 3, 4, 0, 1];
+    let mut session = DllmSession::new(&gguf, &bytes).expect("session");
+    session
+        .denoise_step(&tokens, &[3, 4], (3, 5))
+        .expect("first");
+    assert_eq!(session.prefix_len(), 3);
+
+    let positions = [0, 1, 2, 3, 4];
+    let actual = session
+        .denoise_step(&tokens, &positions, (3, 5))
+        .expect("prefix scores");
+    let expected = denoise_step(&gguf, &bytes, &tokens, &positions, (3, 5)).expect("oracle");
+    assert_step_exact(&actual, &expected);
+}
+
+#[test]
+fn session_lora_switch_invalidates() {
+    let bytes = build_model(false);
+    let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
+    let config = base_config(&bytes);
+    let lora_a = lora_from(build_lora(0, 2, 2, 4.0, false, false), &config);
+    let lora_b = lora_from(build_lora(0, 2, 2, 8.0, false, false), &config);
+    let tokens = [1, 2, 3, 4];
+    let positions = [2, 3];
+    let block = (3, 4);
+
+    let mut session = DllmSession::new(&gguf, &bytes).expect("session");
+    session
+        .denoise_step_with_lora(&tokens, &positions, block, Some(&lora_a))
+        .expect("adapter A");
+    assert_eq!(session.prefix_len(), 3);
+
+    // A different instance (even with the same tensors) must clear the prefix.
+    let actual = session
+        .denoise_step_with_lora(&tokens, &positions, block, Some(&lora_b))
+        .expect("adapter B");
+    let expected = denoise_step_with_lora(&gguf, &bytes, &tokens, &positions, block, Some(&lora_b))
+        .expect("oracle B");
+    assert_step_exact(&actual, &expected);
+
+    // Some -> None is another identity change.
+    let actual = session
+        .denoise_step_with_lora(&tokens, &positions, block, None)
+        .expect("base");
+    let expected = denoise_step(&gguf, &bytes, &tokens, &positions, block).expect("oracle base");
+    assert_step_exact(&actual, &expected);
+
+    // A bound adapter is the default for the plain methods.
+    let bound = DllmSession::with_lora(&gguf, &bytes, &lora_a).expect("bound session");
+    let mut bound = bound;
+    let actual = bound
+        .denoise_step(&tokens, &positions, block)
+        .expect("bound step");
+    let expected = denoise_step_with_lora(&gguf, &bytes, &tokens, &positions, block, Some(&lora_a))
+        .expect("oracle A");
+    assert_step_exact(&actual, &expected);
+}
+
+#[test]
+fn session_ignores_tail_with_warm_cache() {
+    let bytes = build_hardened_model();
+    let gguf = Gguf::parse(&bytes).expect("parse hardened dLLM");
+    let tokens = [1, 2, 3, 4, 0, 1];
+    let positions = [2, 3];
+    let mut session = DllmSession::new(&gguf, &bytes).expect("session");
+    let warm = session
+        .denoise_step(&tokens, &positions, (2, 4))
+        .expect("warm");
+
+    let mut changed = tokens;
+    changed[4] = 3;
+    changed[5] = 0;
+    let actual = session
+        .denoise_step(&changed, &positions, (2, 4))
+        .expect("tail changed");
+    let expected = denoise_step(&gguf, &bytes, &changed, &positions, (2, 4)).expect("oracle");
+    assert_step_exact(&warm, &actual);
+    assert_step_exact(&actual, &expected);
+    assert_eq!(session.prefix_len(), 2);
+}
+
+#[test]
+fn session_hardened_golden_logits_still_pass() {
+    let bytes = build_hardened_model();
+    let gguf = Gguf::parse(&bytes).expect("parse hardened dLLM");
+    let tokens = [1, 2, 3, 4, 0, 1, 2, 3];
+    let mut session = DllmSession::new(&gguf, &bytes).expect("session");
+    let out = session
+        .denoise_step(&tokens, &[0, 4, 7], (0, 8))
+        .expect("hardened");
+    const GOLDEN: [f32; 15] = [
+        -0.5107393,
+        -0.2641858,
+        -1.0002869,
+        0.42415598,
+        1.2973803,
+        -0.74567235,
+        -0.18163148,
+        -0.8792292,
+        0.6298983,
+        1.3569688,
+        -0.052192926,
+        -0.10673007,
+        -0.9995232,
+        0.49606305,
+        1.153955,
+    ];
+    for (index, (left, right)) in out.logits.iter().zip(&GOLDEN).enumerate() {
+        assert!(
+            (left - right).abs() < 1e-4,
+            "golden value {index} differs: {left} != {right}"
+        );
+    }
+}
+
+#[test]
+fn session_cache_is_untouched_on_error_and_clear_resets_it() {
+    let bytes = build_hardened_model();
+    let gguf = Gguf::parse(&bytes).expect("parse hardened dLLM");
+    let tokens = [1, 2, 3, 4, 0, 1];
+    let mut session = DllmSession::new(&gguf, &bytes).expect("session");
+    session
+        .denoise_step(&tokens, &[3, 4], (3, 5))
+        .expect("first");
+    assert_eq!(session.prefix_len(), 3);
+
+    // Duplicate positions fail validation before any tensor is read.
+    assert!(session.denoise_step(&tokens, &[3, 3], (3, 5)).is_err());
+    assert!(session.denoise_topk(&tokens, &[4], (3, 5), 0).is_err());
+    assert_eq!(session.prefix_len(), 3);
+
+    let positions = [3, 4];
+    let actual = session
+        .denoise_step(&tokens, &positions, (3, 5))
+        .expect("after error");
+    let expected = denoise_step(&gguf, &bytes, &tokens, &positions, (3, 5)).expect("oracle");
+    assert_step_exact(&actual, &expected);
+
+    session.clear();
+    assert_eq!(session.prefix_len(), 0);
+    let actual = session
+        .denoise_step(&tokens, &positions, (3, 5))
+        .expect("after clear");
+    assert_step_exact(&actual, &expected);
+}
+
+#[test]
+fn session_single_fresh_row_matches_free_step_with_simd_on_and_off() {
+    let _guard = CACHE_SIMD_LOCK.lock().unwrap();
+    let bytes = build_hardened_model();
+    let gguf = Gguf::parse(&bytes).expect("parse hardened dLLM");
+    let tokens = [1, 2, 3, 4, 0];
+    let positions = [3, 4];
+
+    for enabled in [true, false] {
+        simd::set_enabled(enabled);
+        let mut session = DllmSession::new(&gguf, &bytes).expect("session");
+        session
+            .denoise_step(&tokens, &positions, (4, 5))
+            .expect("warm up");
+        assert_eq!(session.prefix_len(), 4);
+        // Only row 4 is fresh, so the cached matmul batch is padded to two
+        // rows to match the uncached kernel.
+        let actual = session
+            .denoise_step(&tokens, &positions, (4, 5))
+            .expect("single row");
+        let expected = denoise_step(&gguf, &bytes, &tokens, &positions, (4, 5)).expect("oracle");
+        assert_step_exact(&actual, &expected);
+    }
+    simd::set_enabled(true);
+}
+
+fn multi_step_tokens(step: usize) -> Vec<u32> {
+    let mut tokens = vec![1, 2, 3, 4, 0, 1, 2, 3];
+    match step {
+        // Index 0 is inside the prefix committed by the previous step.
+        2 => tokens[0] = 3,
+        // Index 6 is a tail position for this step and must stay ignored.
+        4 => tokens[6] = 2,
+        _ => {}
+    }
+    tokens
+}
+
+fn positions_for_block(block: (usize, usize)) -> Vec<usize> {
+    let mut positions: Vec<usize> = (0..block.1).filter(|index| index % 2 == 0).collect();
+    if !positions.contains(&(block.1 - 1)) {
+        positions.push(block.1 - 1);
+    }
+    positions
+}
+
+#[test]
+fn session_multi_step_differential_with_simd_on_and_off() {
+    let _guard = CACHE_SIMD_LOCK.lock().unwrap();
+    let bytes = build_hardened_model();
+    let gguf = Gguf::parse(&bytes).expect("parse hardened dLLM");
+    let blocks: [(usize, usize); 6] = [(0, 3), (3, 6), (2, 5), (5, 8), (1, 4), (4, 8)];
+
+    for enabled in [true, false] {
+        simd::set_enabled(enabled);
+        let mut session = DllmSession::new(&gguf, &bytes).expect("session");
+        for (step, block) in blocks.into_iter().enumerate() {
+            let tokens = multi_step_tokens(step);
+            let positions = positions_for_block(block);
+
+            let expected_step =
+                denoise_step(&gguf, &bytes, &tokens, &positions, block).expect("oracle step");
+            let actual_step = session
+                .denoise_step(&tokens, &positions, block)
+                .expect("cached step");
+            assert_step_exact(&actual_step, &expected_step);
+
+            // The top-k call reuses the prefix just committed by the logit call.
+            let expected_top =
+                denoise_topk(&gguf, &bytes, &tokens, &positions, block, 3).expect("oracle topk");
+            let actual_top = session
+                .denoise_topk(&tokens, &positions, block, 3)
+                .expect("cached topk");
+            assert_topk_exact(&actual_top, &expected_top);
+        }
+    }
+    simd::set_enabled(true);
 }
