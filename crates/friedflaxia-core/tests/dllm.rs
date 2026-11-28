@@ -991,19 +991,27 @@ fn real_dllm_cache_matches_uncached_q4_0() {
     let gguf = Gguf::parse(&bytes).expect("parse dLLM GGUF");
     let config = DllmConfig::from_gguf(&gguf).expect("config");
 
-    let mut tokens = vec![1u32; 12];
+    let mut tokens = vec![1u32; 16];
     tokens[0] = 151_644;
     tokens[1] = 872;
     tokens[2] = 151_645;
     tokens[3] = 151_669;
 
     let mut session = DllmSession::new(&gguf, &bytes).expect("session");
-    let steps = [((0, 8), vec![4, 5, 6]), ((4, 12), vec![8, 9, 10])];
+    // Step 1 commits no prefix (the whole step is one block). Step 2 advances
+    // the block past it, so the second `denoise_step` reuses eight cached rows.
+    // Step 3 moves the block backwards to a single fresh row, exercising the
+    // backwards-block truncation and the one-row Q4_0 matmul padding.
+    let steps = [
+        ((0, 8), vec![4, 5, 6]),
+        ((8, 16), vec![12, 13, 14]),
+        ((7, 8), vec![7]),
+    ];
     for (index, (block, positions)) in steps.into_iter().enumerate() {
         if index == 1 {
             // Simulate the host committing new tokens into the former block.
             for (offset, token) in [12138u32, 525, 151_669, 774].into_iter().enumerate() {
-                tokens[4 + offset] = token;
+                tokens[8 + offset] = token;
             }
         }
         let expected = denoise_step(&gguf, &bytes, &tokens, &positions, block).expect("oracle");
@@ -1012,6 +1020,7 @@ fn real_dllm_cache_matches_uncached_q4_0() {
             .expect("cached");
         assert_eq!(actual.positions, expected.positions);
         assert_eq!(actual.vocab_size, config.vocab_size);
+        assert_eq!(session.prefix_len(), [0, 8, 7][index]);
         // Q4_0 kernels can differ by a few ULPs depending on the batch shape.
         for (position, (left, right)) in actual
             .logits
@@ -1556,4 +1565,59 @@ fn session_multi_step_differential_with_simd_on_and_off() {
         }
     }
     simd::set_enabled(true);
+}
+
+/// Reference candidates produced by `tools/dllm_reference.py` against the
+/// pinned HF checkpoint in BF16. The GGUF is converted to Q8_0, so a few
+/// near-tied tail candidates can swap; top-1 must agree and at least seven of
+/// eight candidates must overlap.
+#[test]
+#[ignore = "requires FRIEDFLAXIA_DLLM_Q8_GGUF converted from the pinned HF checkpoint"]
+fn real_dllm_matches_pytorch_reference() {
+    let Ok(path) = std::env::var("FRIEDFLAXIA_DLLM_Q8_GGUF") else {
+        eprintln!("skipping: FRIEDFLAXIA_DLLM_Q8_GGUF is not set");
+        return;
+    };
+    let bytes = std::fs::read(path).expect("read dLLM GGUF");
+    let gguf = Gguf::parse(&bytes).expect("parse dLLM GGUF");
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/dllm-pytorch-top8.json")).expect("fixture");
+    let tokens: Vec<u32> = fixture["tokens"]
+        .as_array()
+        .expect("tokens")
+        .iter()
+        .map(|value| value.as_u64().expect("token id") as u32)
+        .collect();
+    let positions: Vec<usize> = fixture["positions"]
+        .as_array()
+        .expect("positions")
+        .iter()
+        .map(|value| value.as_u64().expect("position") as usize)
+        .collect();
+    let block = (
+        fixture["block"][0].as_u64().expect("block start") as usize,
+        fixture["block"][1].as_u64().expect("block end") as usize,
+    );
+    let top_k = fixture["top_k"].as_u64().expect("top_k") as usize;
+    let actual = denoise_topk(&gguf, &bytes, &tokens, &positions, block, top_k).expect("denoise");
+
+    for (index, position) in positions.iter().enumerate() {
+        let expected = &fixture["token_ids"][index];
+        let reference: Vec<u32> = expected
+            .as_array()
+            .expect("candidates")
+            .iter()
+            .map(|value| value.as_u64().expect("token id") as u32)
+            .collect();
+        let row = &actual.token_ids[index * top_k..(index + 1) * top_k];
+        assert_eq!(
+            row[0], reference[0],
+            "position {position}: top-1 disagrees with the PyTorch reference"
+        );
+        let overlap = row.iter().filter(|id| reference.contains(id)).count();
+        assert!(
+            overlap >= top_k - 1,
+            "position {position}: only {overlap}/{top_k} candidates agree with PyTorch: {row:?} vs {reference:?}"
+        );
+    }
 }

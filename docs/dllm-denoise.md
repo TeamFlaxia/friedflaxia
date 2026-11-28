@@ -7,7 +7,9 @@ implemented FriedFlaxia extension and what is still missing.
 > Status: the qwen3-dllm forward pass, block attention mask, full-logit and
 > top-k APIs, LoRA adapters, the wasm bindings, the native `DllmSession`
 > block/KV prefix cache, and the offline Rust training CLI are implemented.
-> Real-model (PyTorch) logit parity and a real LoRA adapter pin are still open.
+> Top-candidate parity against the pinned PyTorch checkpoint is validated on
+> the converted Q8_0 model; bit-exact BF16 logit parity and a real LoRA adapter
+> pin are still open.
 
 ## Implemented
 
@@ -134,7 +136,7 @@ as its own process on its own schedule, outside inference traffic.
 | LoRA adapter GGUF production (`qwen3-dllm-lora`) | implemented by the Rust `Writer` + train CLI |
 | Real LoRA GGUF artifact and actual pin values | **not configured yet** (only generated/synthetic adapters have been used) |
 | Block/KV cache (`DllmSession`, native) | implemented |
-| PyTorch logit parity | **still open** (no real-model parity claim) |
+| PyTorch top-candidate parity (Q8_0) | validated; bit-exact BF16 parity not claimed |
 
 ## Block/KV cache
 
@@ -177,10 +179,11 @@ remains, the cached projection batch is padded with an unused row so the Q4_0
 
 1. **SDAR self-conditioning.** QwenDLM's residual adapter is not implemented;
    the base Qwen3 forward is.
-2. **Real-model parity.** The synthetic tiny GGUFs cover the mask, API and
-   cache equivalence, and the converted BD3LM validation model now runs end to
-   end. A logit parity check against the PyTorch reference is still required;
-   no real-model parity is claimed here.
+2. **Bit-exact BF16 parity.** The synthetic tiny GGUFs cover the mask, API and
+   cache equivalence; the converted BD3LM validation model runs end to end and
+   its top candidates match the PyTorch reference (see below). Q4_0 tail
+   candidates can still swap when logits are near-tied, so bit-exact logit
+   parity with the BF16 checkpoint is not claimed.
 3. **Sampling and ensemble.** The host owns sampling, Self-Repulsion and delta
    merging. Rust only returns scores.
 
@@ -228,6 +231,32 @@ which Qwen prompts require. Input is assumed to be NFC-normalized. Chat prompts 
 block. This is an algorithm-validation model, not a production chat model, and
 the converter is a **reference** tool: production artifacts follow the Rust path
 described above, with the Rust GGUF loader as the compatibility authority.
+
+## PyTorch reference parity
+
+`tools/dllm_reference.py` loads the pinned HF checkpoint in BF16 with
+Transformers' stock Qwen3 model and applies the same block mask as the Rust
+kernel. It writes top-k candidates (and optionally raw f32 logits) for a fixed
+token sequence, which the ignored
+`real_dllm_matches_pytorch_reference` test compares against a converted Q8_0
+GGUF:
+
+```sh
+python3 tools/convert_dllm.py <hf-checkpoint-dir> /tmp/dllm-q8.gguf --quant q8_0
+python3 tools/dllm_reference.py --model-dir <hf-checkpoint-dir> \
+  --tokens 151644,872,151645,151669,100,200,300,400 \
+  --block-start 0 --block-end 8 --positions 4,5,6 \
+  --out crates/friedflaxia-core/tests/fixtures/dllm-pytorch-top8.json
+FRIEDFLAXIA_DLLM_Q8_GGUF=/tmp/dllm-q8.gguf \
+  cargo test --release --test dllm -- --ignored --nocapture
+```
+
+On the pinned 0.6B checkpoint, the Q8_0 Rust logits have cosine similarity
+0.9999 with the BF16 reference and agree on top-1 for all three positions and
+on 7 of 8 candidates each. Q4_0 quantization is coarser and swaps near-tied
+tail candidates, which is why the parity fixture uses Q8_0. The CI `dllm-parity`
+job separately verifies the pinned Q4_0 model end to end and the cached-vs-
+uncached equivalence.
 
 ## Performance
 
