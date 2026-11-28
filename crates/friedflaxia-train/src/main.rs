@@ -2,10 +2,11 @@
 
 use friedflaxia_core::gguf::Gguf;
 use friedflaxia_core::train::es::{EsConfig, EsSample, es_step};
-use friedflaxia_core::train::lora_grad::{LoraPair, cross_entropy_grad, grpo_grad};
-use friedflaxia_core::train::lora_weights::{LoraWeights, Side};
+use friedflaxia_core::train::lora_grad::{cross_entropy_grad, grpo_grad};
+use friedflaxia_core::train::lora_weights::{LoraPairSlot, LoraWeights};
 use friedflaxia_core::train::optimizer::AdamW;
 use serde::Deserialize;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CliError {
@@ -15,6 +16,8 @@ pub enum CliError {
     InvalidLearningRate,
     InvalidTarget,
     ShapeMismatch,
+    /// An `inputs` key did not name an A/B pair present in the adapter.
+    UnknownPair,
     InvalidCommand,
 }
 
@@ -37,10 +40,30 @@ pub enum TrainMode {
     Grpo,
 }
 
-/// One cached-base training example: `x` is the frozen hidden activation.
+/// Inputs for one named A/B pair. `dout` is optional: when absent it is
+/// derived from the example's `logits` (and `target` / `sampled`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PairInput {
+    /// Frozen base activation `[in_dim]`; always required.
+    pub x: Vec<f32>,
+    /// Upstream gradient `[out_dim]`, if the caller already has it.
+    pub dout: Option<Vec<f32>>,
+}
+
+/// One cached-base training example.
+///
+/// Two JSON shapes are accepted (but not both at once):
+///
+/// - legacy `"x": [...]`: the same activation is applied to every A/B pair;
+/// - `"inputs": {"blk.<layer>.<module>": {"x": [...], "dout": [...]}}`:
+///   each named pair gets its own activation and optional upstream gradient.
+///   Pairs absent from `inputs` are not updated.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrainExample {
+    /// Legacy shared activation; empty when `inputs` is used.
     pub x: Vec<f32>,
+    /// Per-pair inputs keyed by `blk.<layer>.<module>`; empty in legacy mode.
+    pub inputs: BTreeMap<String, PairInput>,
     pub logits: Vec<f32>,
     pub target: usize,
     pub sampled: usize,
@@ -48,8 +71,17 @@ pub struct TrainExample {
 }
 
 #[derive(Debug, Deserialize)]
+struct PairInputJson {
+    x: Option<Vec<f32>>,
+    dout: Option<Vec<f32>>,
+}
+
+#[derive(Debug, Deserialize)]
 struct TrainExampleJson {
-    x: Vec<f32>,
+    #[serde(default)]
+    x: Option<Vec<f32>>,
+    #[serde(default)]
+    inputs: Option<BTreeMap<String, PairInputJson>>,
     logits: Vec<f32>,
     #[serde(default)]
     target: Option<usize>,
@@ -77,12 +109,49 @@ fn parse_train_round(text: &str, mode: TrainMode) -> Result<(f32, Vec<TrainExamp
         .examples
         .into_iter()
         .map(|example| {
-            if !example.x.iter().all(|v| v.is_finite())
-                || !example.logits.iter().all(|v| v.is_finite())
-                || example.logits.is_empty()
-            {
+            if example.x.is_some() == example.inputs.is_some() {
+                // Exactly one of legacy `x` and named `inputs` is allowed.
                 return Err(CliError::InvalidSamples);
             }
+            if example.logits.is_empty() || !example.logits.iter().all(|v| v.is_finite()) {
+                return Err(CliError::InvalidSamples);
+            }
+            let (x, inputs) = match (example.x, example.inputs) {
+                (Some(x), None) => {
+                    if x.is_empty() || !x.iter().all(|v| v.is_finite()) {
+                        return Err(CliError::InvalidSamples);
+                    }
+                    (x, BTreeMap::new())
+                }
+                (None, Some(entries)) => {
+                    if entries.is_empty() {
+                        return Err(CliError::InvalidSamples);
+                    }
+                    let mut inputs = BTreeMap::new();
+                    for (name, input) in entries {
+                        let Some(x) = input.x else {
+                            return Err(CliError::InvalidSamples);
+                        };
+                        if x.is_empty() || !x.iter().all(|v| v.is_finite()) {
+                            return Err(CliError::InvalidSamples);
+                        }
+                        if let Some(dout) = &input.dout {
+                            if dout.is_empty() || !dout.iter().all(|v| v.is_finite()) {
+                                return Err(CliError::InvalidSamples);
+                            }
+                        }
+                        inputs.insert(
+                            name,
+                            PairInput {
+                                x,
+                                dout: input.dout,
+                            },
+                        );
+                    }
+                    (Vec::new(), inputs)
+                }
+                _ => return Err(CliError::InvalidSamples),
+            };
             let target = match example.target {
                 Some(target) => target,
                 None if mode == TrainMode::Sft => return Err(CliError::InvalidSamples),
@@ -96,7 +165,8 @@ fn parse_train_round(text: &str, mode: TrainMode) -> Result<(f32, Vec<TrainExamp
                 ),
             };
             let parsed = TrainExample {
-                x: example.x,
+                x,
+                inputs,
                 logits: example.logits,
                 target,
                 sampled,
@@ -153,11 +223,28 @@ fn es_update(adapter_bytes: &[u8], samples: &[EsSample], alpha: f32) -> Result<V
 }
 
 fn validate_example(example: &TrainExample, mode: TrainMode) -> Result<(), CliError> {
-    if example.logits.is_empty() {
+    if example.logits.is_empty() || !example.logits.iter().all(|v| v.is_finite()) {
         return Err(CliError::InvalidSamples);
     }
-    if !example.x.iter().all(|v| v.is_finite()) || !example.logits.iter().all(|v| v.is_finite()) {
-        return Err(CliError::InvalidSamples);
+    if example.inputs.is_empty() {
+        if example.x.is_empty() || !example.x.iter().all(|v| v.is_finite()) {
+            return Err(CliError::InvalidSamples);
+        }
+    } else {
+        if !example.x.is_empty() {
+            return Err(CliError::InvalidSamples);
+        }
+        for input in example.inputs.values() {
+            if input.x.is_empty()
+                || !input.x.iter().all(|v| v.is_finite())
+                || input
+                    .dout
+                    .as_ref()
+                    .is_some_and(|dout| dout.is_empty() || !dout.iter().all(|v| v.is_finite()))
+            {
+                return Err(CliError::InvalidSamples);
+            }
+        }
     }
     match mode {
         TrainMode::Sft => {
@@ -175,62 +262,6 @@ fn validate_example(example: &TrainExample, mode: TrainMode) -> Result<(), CliEr
         }
     }
     Ok(())
-}
-
-/// An A/B pair positioned in the flat parameter vector (`flatten` order).
-struct PairSlot {
-    pair: LoraPair,
-    a_start: usize,
-    b_start: usize,
-}
-
-/// Rebuild trainable `LoraPair`s from an adapter. No base forward is involved:
-/// `x` comes from the round file and only A/B are updated.
-fn pair_slots(weights: &LoraWeights) -> Result<Vec<PairSlot>, CliError> {
-    let tensors = weights.tensors();
-    let a_keys: Vec<_> = tensors
-        .keys()
-        .filter(|(_, _, side)| *side == Side::A)
-        .map(|(layer, module, _)| (*layer, *module))
-        .collect();
-    let b_keys: Vec<_> = tensors
-        .keys()
-        .filter(|(_, _, side)| *side == Side::B)
-        .map(|(layer, module, _)| (*layer, *module))
-        .collect();
-    if a_keys.is_empty() || a_keys != b_keys {
-        return Err(CliError::InvalidAdapter);
-    }
-
-    let rank = weights.rank();
-    let scale = weights.alpha() / rank as f32;
-    let mut slots = Vec::with_capacity(a_keys.len());
-    let mut cursor = 0usize;
-    for (layer, module) in a_keys {
-        let a = &tensors[&(layer, module, Side::A)];
-        let b = &tensors[&(layer, module, Side::B)];
-        let in_dim = a.len() / rank;
-        let out_dim = b.len() / rank;
-        if in_dim == 0 || out_dim == 0 || a.len() % rank != 0 || b.len() % rank != 0 {
-            return Err(CliError::InvalidAdapter);
-        }
-        let pair = LoraPair {
-            a: a.clone(),
-            b: b.clone(),
-            in_dim,
-            out_dim,
-            rank,
-            scale,
-        };
-        pair.validate().map_err(|_| CliError::InvalidAdapter)?;
-        slots.push(PairSlot {
-            pair,
-            a_start: cursor,
-            b_start: cursor + a.len(),
-        });
-        cursor += a.len() + b.len();
-    }
-    Ok(slots)
 }
 
 /// Run one batched AdamW step over all examples and return a loadable adapter.
@@ -253,22 +284,47 @@ fn train_update(
     let gguf = Gguf::parse(adapter_bytes).map_err(|_| CliError::InvalidAdapter)?;
     let weights =
         LoraWeights::from_gguf(&gguf, adapter_bytes).map_err(|_| CliError::InvalidAdapter)?;
-    let slots = pair_slots(&weights)?;
+    // Named pairs come straight from the adapter iterator: no base forward,
+    // no assumption that every pair shares the same in/out dimensions.
+    let slots: Vec<LoraPairSlot> = weights
+        .iter_pairs()
+        .collect::<Result<_, _>>()
+        .map_err(|_| CliError::InvalidAdapter)?;
+    if slots.is_empty() {
+        return Err(CliError::InvalidAdapter);
+    }
+    let names: BTreeSet<_> = slots.iter().map(LoraPairSlot::name).collect();
+    for example in examples {
+        if example.inputs.keys().any(|name| !names.contains(name)) {
+            return Err(CliError::UnknownPair);
+        }
+    }
+
     let mut flat = weights.flatten();
     let mut grads = vec![0.0_f32; flat.len()];
 
     for example in examples {
-        let dout = match mode {
+        let derived_dout = match mode {
             TrainMode::Sft => cross_entropy_grad(&example.logits, example.target),
             TrainMode::Grpo => grpo_grad(&example.logits, example.sampled, example.advantage),
         };
         for slot in &slots {
-            if example.x.len() != slot.pair.in_dim || dout.len() != slot.pair.out_dim {
+            // Named inputs select exactly the pairs to update; legacy shared
+            // `x` still applies to all pairs. Unnamed pairs keep zero grads.
+            let (x, dout): (&[f32], &[f32]) = if example.inputs.is_empty() {
+                (&example.x, &derived_dout)
+            } else {
+                let Some(input) = example.inputs.get(&slot.name()) else {
+                    continue;
+                };
+                (&input.x, input.dout.as_deref().unwrap_or(&derived_dout))
+            };
+            if x.len() != slot.pair.in_dim || dout.len() != slot.pair.out_dim {
                 return Err(CliError::ShapeMismatch);
             }
             let local = slot
                 .pair
-                .backward(&example.x, &dout)
+                .backward(x, dout)
                 .map_err(|_| CliError::InvalidAdapter)?;
             for (dst, value) in grads[slot.a_start..slot.a_start + local.da.len()]
                 .iter_mut()
@@ -356,6 +412,42 @@ mod tests {
     use super::*;
     use friedflaxia_core::gguf::Value;
     use friedflaxia_core::gguf::writer::Writer;
+    use friedflaxia_core::models::lora::LoraModule;
+    use friedflaxia_core::train::lora_weights::Side;
+
+    /// Same rank, but attn_q is [in=2, out=2] and ffn_down is [in=4, out=3].
+    /// A single shared `x` / `dout` cannot drive both of them.
+    fn heterogeneous_adapter_bytes() -> Vec<u8> {
+        let mut writer = Writer::new(2, 4.0, "code").unwrap();
+        writer
+            .add_tensor("blk.0.attn_q.lora_a.weight", &[2, 2], &[0.1, 0.2, 0.3, 0.4])
+            .unwrap();
+        writer
+            .add_tensor("blk.0.attn_q.lora_b.weight", &[2, 2], &[0.5, 0.6, 0.7, 0.8])
+            .unwrap();
+        writer
+            .add_tensor(
+                "blk.0.ffn_down.lora_a.weight",
+                &[4, 2],
+                &[0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08],
+            )
+            .unwrap();
+        writer
+            .add_tensor(
+                "blk.0.ffn_down.lora_b.weight",
+                &[2, 3],
+                &[0.11, 0.12, 0.13, 0.14, 0.15, 0.16],
+            )
+            .unwrap();
+        writer.finish()
+    }
+
+    /// Per-pair `x` and `dout`; logits only carry the SFT target here.
+    const SFT_INPUTS_JSON: &str = r#"{"lr":0.001,"examples":[{"inputs":{"blk.0.attn_q":{"x":[0.1,0.2],"dout":[0.5,-0.2]},"blk.0.ffn_down":{"x":[0.1,0.2,0.3,0.4],"dout":[0.5,-0.2,0.1]}},"logits":[0.5,-0.2],"target":0}]}"#;
+
+    fn tensor(weights: &LoraWeights, module: LoraModule, side: Side) -> &[f32] {
+        &weights.tensors()[&(0, module, side)]
+    }
 
     fn adapter_bytes() -> Vec<u8> {
         let mut writer = Writer::new(2, 64.0, "code").unwrap();
@@ -516,6 +608,7 @@ mod tests {
         // x はキャッシュ済み隠れ活性なので in_dim と一致しなければならない。
         let bad_x = vec![TrainExample {
             x: vec![0.1, 0.2, 0.3],
+            inputs: BTreeMap::new(),
             logits: vec![0.5, -0.2],
             target: 0,
             sampled: 0,
@@ -528,6 +621,7 @@ mod tests {
         // logits の長さは B の out_dim と一致しなければならない。
         let bad_logits = vec![TrainExample {
             x: vec![0.1, 0.2],
+            inputs: BTreeMap::new(),
             logits: vec![0.5, -0.2, 0.1],
             target: 0,
             sampled: 0,
@@ -555,6 +649,7 @@ mod tests {
         );
         let bad_advantage = vec![TrainExample {
             x: vec![0.1, 0.2],
+            inputs: BTreeMap::new(),
             logits: vec![0.5, -0.2],
             target: 0,
             sampled: 0,
@@ -601,5 +696,130 @@ mod tests {
             run_command("unknown", &bytes, SFT_JSON),
             Err(CliError::InvalidCommand)
         );
+    }
+
+    #[test]
+    fn sft_updates_both_pairs_with_distinct_named_shapes() {
+        let bytes = heterogeneous_adapter_bytes();
+        let before = train_weights(&bytes);
+        let (lr, examples) = parse_sft(SFT_INPUTS_JSON).unwrap();
+        assert_eq!(examples.len(), 1);
+
+        let out = run_command("sft", &bytes, SFT_INPUTS_JSON).unwrap();
+        let after = train_weights(&out);
+        for module in [LoraModule::AttnQ, LoraModule::FfnDown] {
+            for side in [Side::A, Side::B] {
+                assert_ne!(
+                    tensor(&after, module, side),
+                    tensor(&before, module, side),
+                    "{module:?}/{side:?} must be updated with its own x/dout"
+                );
+            }
+        }
+        // No ShapeMismatch from a single shared vector, and lr is still parsed.
+        assert_eq!(lr, 0.001);
+    }
+
+    #[test]
+    fn unspecified_pairs_are_left_unchanged() {
+        let bytes = heterogeneous_adapter_bytes();
+        let before = train_weights(&bytes);
+        let json = r#"{"lr":0.001,"examples":[{"inputs":{"blk.0.attn_q":{"x":[0.1,0.2],"dout":[0.5,-0.2]}},"logits":[0.5,-0.2],"target":0}]}"#;
+        let out = run_command("sft", &bytes, json).unwrap();
+        let after = train_weights(&out);
+
+        assert_ne!(
+            tensor(&after, LoraModule::AttnQ, Side::A),
+            tensor(&before, LoraModule::AttnQ, Side::A)
+        );
+        assert_ne!(
+            tensor(&after, LoraModule::AttnQ, Side::B),
+            tensor(&before, LoraModule::AttnQ, Side::B)
+        );
+        for side in [Side::A, Side::B] {
+            assert_eq!(
+                tensor(&after, LoraModule::FfnDown, side),
+                tensor(&before, LoraModule::FfnDown, side),
+                "omitted pairs must not be updated"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_x_json_still_works_and_matches_named_form() {
+        let bytes = adapter_bytes();
+        let legacy = run_command("sft", &bytes, SFT_JSON).unwrap();
+        let (_, examples) = parse_sft(SFT_JSON).unwrap();
+        assert_eq!(examples[0].x, vec![0.1, 0.2]);
+
+        // Without an explicit per-pair dout the named form derives it from
+        // logits/target, exactly as the legacy shared-x form does.
+        let named = run_command(
+            "sft",
+            &bytes,
+            r#"{"lr":0.001,"examples":[{"inputs":{"blk.0.attn_q":{"x":[0.1,0.2]}},"logits":[0.5,-0.2],"target":0}]}"#,
+        )
+        .unwrap();
+        assert_eq!(named, legacy, "legacy JSON must remain backward compatible");
+    }
+
+    #[test]
+    fn grpo_supports_named_inputs() {
+        let bytes = heterogeneous_adapter_bytes();
+        let json = r#"{"lr":0.01,"examples":[{"inputs":{"blk.0.ffn_down":{"x":[0.1,0.2,0.3,0.4],"dout":[0.5,-0.2,0.1]}},"logits":[0.5,-0.2],"sampled":0,"advantage":0.7}]}"#;
+        let out = run_command("grpo", &bytes, json).unwrap();
+        let before = train_weights(&bytes);
+        let after = train_weights(&out);
+        assert_ne!(
+            tensor(&after, LoraModule::FfnDown, Side::A),
+            tensor(&before, LoraModule::FfnDown, Side::A)
+        );
+        assert_eq!(
+            tensor(&after, LoraModule::AttnQ, Side::A),
+            tensor(&before, LoraModule::AttnQ, Side::A)
+        );
+    }
+
+    #[test]
+    fn unknown_pair_names_are_rejected() {
+        let bytes = heterogeneous_adapter_bytes();
+        let json = r#"{"lr":0.001,"examples":[{"inputs":{"blk.0.nope":{"x":[0.1,0.2],"dout":[0.5,-0.2]}},"logits":[0.5,-0.2],"target":0}]}"#;
+        assert_eq!(run_command("sft", &bytes, json), Err(CliError::UnknownPair));
+        let malformed = r#"{"lr":0.001,"examples":[{"inputs":{"attn_q":{"x":[0.1,0.2]}},"logits":[0.5,-0.2],"target":0}]}"#;
+        assert_eq!(
+            run_command("sft", &bytes, malformed),
+            Err(CliError::UnknownPair)
+        );
+    }
+
+    #[test]
+    fn invalid_named_input_lengths_are_rejected() {
+        let bytes = heterogeneous_adapter_bytes();
+        let bad_x = r#"{"lr":0.001,"examples":[{"inputs":{"blk.0.attn_q":{"x":[0.1,0.2,0.3],"dout":[0.5,-0.2]}},"logits":[0.5,-0.2],"target":0}]}"#;
+        assert_eq!(
+            run_command("sft", &bytes, bad_x),
+            Err(CliError::ShapeMismatch)
+        );
+        let bad_dout = r#"{"lr":0.001,"examples":[{"inputs":{"blk.0.ffn_down":{"x":[0.1,0.2,0.3,0.4],"dout":[0.5]}},"logits":[0.5,-0.2],"target":0}]}"#;
+        assert_eq!(
+            run_command("sft", &bytes, bad_dout),
+            Err(CliError::ShapeMismatch)
+        );
+        // A pair without explicit dout must match the logits-derived one.
+        let bad_derived = r#"{"lr":0.001,"examples":[{"inputs":{"blk.0.ffn_down":{"x":[0.1,0.2,0.3,0.4]}},"logits":[0.5,-0.2],"target":0}]}"#;
+        assert_eq!(
+            run_command("sft", &bytes, bad_derived),
+            Err(CliError::ShapeMismatch)
+        );
+    }
+
+    #[test]
+    fn ambiguous_or_empty_inputs_are_rejected() {
+        let both = r#"{"lr":0.001,"examples":[{"x":[0.1,0.2],"inputs":{"blk.0.attn_q":{"x":[0.1,0.2]}},"logits":[0.5,-0.2],"target":0}]}"#;
+        assert_eq!(parse_sft(both), Err(CliError::InvalidSamples));
+        let neither = r#"{"lr":0.001,"examples":[{"logits":[0.5,-0.2],"target":0}]}"#;
+        assert_eq!(parse_sft(neither), Err(CliError::InvalidSamples));
+        let missing_x = r#"{"lr":0.001,"examples":[{"inputs":{"blk.0.attn_q":{"dout":[0.5,-0.2]}},"logits":[0.5,-0.2],"target":0}]}"#;
+        assert_eq!(parse_sft(missing_x), Err(CliError::InvalidSamples));
     }
 }

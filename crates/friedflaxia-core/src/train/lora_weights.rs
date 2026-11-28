@@ -9,6 +9,7 @@ use crate::gguf::writer::{Writer, WriterError};
 use crate::gguf::{ConfigError, Gguf, GgufError, ModelConfig, TensorType};
 use crate::models::lora::{LORA_ARCHITECTURE, LoraModule};
 use crate::tensor::{TensorError, tensor};
+use crate::train::lora_grad::{GradError, LoraPair};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -42,6 +43,27 @@ impl Side {
             Self::A => "lora_a",
             Self::B => "lora_b",
         }
+    }
+}
+
+/// One complete A/B pair, named by its base projection, plus its offsets in
+/// [`LoraWeights::flatten`] order. Offsets let a caller accumulate gradients
+/// into the flat parameter vector without re-deriving the BTreeMap layout.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoraPairSlot {
+    pub layer: usize,
+    pub module: LoraModule,
+    pub pair: LoraPair,
+    /// Start of `pair.a` in the flat parameter vector.
+    pub a_start: usize,
+    /// Start of `pair.b` in the flat parameter vector.
+    pub b_start: usize,
+}
+
+impl LoraPairSlot {
+    /// Canonical key used by SFT/GRPO round files: `blk.{layer}.{module}`.
+    pub fn name(&self) -> String {
+        format!("blk.{}.{}", self.layer, self.module.suffix())
     }
 }
 
@@ -124,6 +146,55 @@ impl LoraWeights {
             flat.extend_from_slice(values);
         }
         flat
+    }
+
+    /// Iterate named A/B pairs in the same order as [`Self::flatten`].
+    ///
+    /// Each yielded slot owns a validated [`LoraPair`] (A `[in, rank]`, B
+    /// `[rank, out]`) and the flat offsets of its two halves. A half without
+    /// its partner is reported as [`WeightError::MissingPair`] rather than
+    /// being silently skipped.
+    pub fn iter_pairs(&self) -> impl Iterator<Item = Result<LoraPairSlot, WeightError>> + '_ {
+        let rank = self.rank;
+        let scale = self.alpha / rank as f32;
+        let tensors = &self.tensors;
+        tensors
+            .iter()
+            .scan(0usize, move |cursor, ((layer, module, side), values)| {
+                let a_start = *cursor;
+                *cursor += values.len(); // B follows A for the same key prefix.
+                let name = format!("blk.{layer}.{}", module.suffix());
+                let partner = match side {
+                    Side::A => Side::B,
+                    Side::B => Side::A,
+                };
+                let Some(partner_values) = tensors.get(&(*layer, *module, partner)) else {
+                    return Some(Some(Err(WeightError::MissingPair(name))));
+                };
+                if *side == Side::B {
+                    // Emitted together with the A half, which sorts first.
+                    return Some(None);
+                }
+                let in_dim = values.len() / rank;
+                let out_dim = partner_values.len() / rank;
+                let pair = LoraPair {
+                    a: values.clone(),
+                    b: partner_values.clone(),
+                    in_dim,
+                    out_dim,
+                    rank,
+                    scale,
+                };
+                let slot = pair.validate().map(|()| LoraPairSlot {
+                    layer: *layer,
+                    module: *module,
+                    pair,
+                    a_start,
+                    b_start: a_start + values.len(),
+                });
+                Some(Some(slot.map_err(WeightError::from)))
+            })
+            .flatten()
     }
 
     /// Rebuild weights from a vector in [`Self::flatten`] order.
@@ -217,7 +288,13 @@ pub enum WeightError {
     MalformedName(String),
     Duplicate(String),
     InvalidShape(String),
-    LengthMismatch { expected: usize, actual: usize },
+    /// One half of an A/B pair is missing: `blk.{layer}.{module}`.
+    MissingPair(String),
+    Grad(GradError),
+    LengthMismatch {
+        expected: usize,
+        actual: usize,
+    },
 }
 
 impl From<GgufError> for WeightError {
@@ -244,6 +321,12 @@ impl From<WriterError> for WeightError {
     }
 }
 
+impl From<GradError> for WeightError {
+    fn from(error: GradError) -> Self {
+        Self::Grad(error)
+    }
+}
+
 impl fmt::Display for WeightError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -263,6 +346,8 @@ impl fmt::Display for WeightError {
             Self::MalformedName(name) => write!(f, "malformed lora tensor name: {name}"),
             Self::Duplicate(name) => write!(f, "duplicate lora tensor: {name}"),
             Self::InvalidShape(name) => write!(f, "invalid shape for lora tensor {name}"),
+            Self::MissingPair(name) => write!(f, "lora pair {name} is missing lora_a or lora_b"),
+            Self::Grad(error) => write!(f, "lora gradient error: {error}"),
             Self::LengthMismatch { expected, actual } => {
                 write!(
                     f,
@@ -433,6 +518,52 @@ mod tests {
         assert!(
             matches!(error, WeightError::UnsupportedType(TensorType::F16)),
             "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn iter_pairs_yields_named_slots_in_flatten_order() {
+        let weights = sample_weights();
+        let slots: Vec<LoraPairSlot> = weights.iter_pairs().collect::<Result<_, _>>().unwrap();
+        assert_eq!(slots.len(), 2);
+
+        assert_eq!(slots[0].name(), "blk.0.attn_q");
+        assert_eq!(slots[0].module, LoraModule::AttnQ);
+        assert_eq!(slots[0].pair.in_dim, 3);
+        assert_eq!(slots[0].pair.out_dim, 4);
+        assert_eq!(slots[0].pair.rank, RANK);
+        assert_eq!(slots[0].pair.scale, ALPHA / RANK as f32);
+        assert_eq!((slots[0].a_start, slots[0].b_start), (0, 6));
+
+        assert_eq!(slots[1].name(), "blk.0.ffn_down");
+        assert_eq!(slots[1].module, LoraModule::FfnDown);
+        assert_eq!(slots[1].pair.in_dim, 4);
+        assert_eq!(slots[1].pair.out_dim, 3);
+        assert_eq!((slots[1].a_start, slots[1].b_start), (14, 22));
+
+        let flat = weights.flatten();
+        for slot in &slots {
+            assert_eq!(
+                slot.pair.a,
+                flat[slot.a_start..slot.a_start + slot.pair.a.len()]
+            );
+            assert_eq!(
+                slot.pair.b,
+                flat[slot.b_start..slot.b_start + slot.pair.b.len()]
+            );
+        }
+    }
+
+    #[test]
+    fn iter_pairs_reports_a_tensor_without_its_other_half() {
+        let mut weights = sample_weights();
+        weights.tensors.remove(&(0, LoraModule::FfnDown, Side::B));
+        let errors: Vec<_> = weights.iter_pairs().filter_map(Result::err).collect();
+        assert!(
+            errors.iter().any(
+                |error| matches!(error, WeightError::MissingPair(name) if name == "blk.0.ffn_down")
+            ),
+            "unexpected errors: {errors:?}"
         );
     }
 }
