@@ -5,6 +5,7 @@
 //! native `friedflaxia-train` CLI during off-time rounds.
 
 pub mod es;
+pub mod lora_factory;
 pub mod lora_grad;
 pub mod lora_weights;
 pub mod optimizer;

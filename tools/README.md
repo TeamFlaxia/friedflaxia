@@ -36,7 +36,7 @@ converter for the pinned NudeNet 320n F32 artifact.
 
 | Area | Status |
 |---|---|
-| LoRA adapter GGUF (`qwen3-dllm-lora`) generation / updates | **Replaced.** `crates/friedflaxia-core/src/gguf/writer.rs` writes GGUF v3 with `rank` / `alpha` / `expert` metadata and F32 `lora_a` / `lora_b` tensors; `crates/friedflaxia-core/src/train/lora_weights.rs` round-trips them; `friedflaxia-train` emits updated adapters. |
+| LoRA adapter GGUF (`qwen3-dllm-lora`) generation / updates | **Replaced (RQ3 solved).** `crates/friedflaxia-core/src/gguf/writer.rs` writes GGUF v3 with `rank` / `alpha` / `expert` metadata and F32 `lora_a` / `lora_b` tensors; `crates/friedflaxia-core/src/train/lora_factory.rs` + `examples/make_lora.rs` generate complete adapters from a base config; `lora_weights.rs` round-trips them; `friedflaxia-train` emits updated adapters. |
 | Adapter-based training | **Replaced.** `friedflaxia-train` implements `es-lora`, `sft` and `grpo` offline (see below). No autograd tape in the runtime; cached hidden activations and logits are the input. |
 | Full base dLLM conversion (safetensors → `qwen3-dllm`) | **Not replaced.** `convert_dllm.py` is currently the only converter for this layout and stays as reference while the migration is in progress. Do not delete it yet. |
 
@@ -64,8 +64,33 @@ converter for the pinned NudeNet 320n F32 artifact.
   Keep pinned dLLM GGUFs at Q8_0 or Q4_0. Adapter tensors stay F32.
 - **Pinning.** Published adapters are immutable: `THEIA_LORA_ADAPTERS` records
   `url` / `sha256` / `maxBytes` / `revision` and nodes advertise
-  `theia-expert-<id>` capabilities. No real LoRA GGUF pin is configured yet —
-  the wiring has only been exercised with generated/synthetic adapters.
+  `theia-expert-<id>` capabilities. Local `code` / `math` / `chat` artifacts
+  exist for internal testing (below), but no trained expert is published and no
+  real pin is configured yet.
+
+## Adapter factory (production path, RQ3)
+
+```sh
+# Prefer reading shapes from the real pinned base GGUF (see model-manifest.json).
+cargo run --release -p friedflaxia-core --example make_lora -- \
+  --base /path/to/qwen3-bd3lm-q4_0.gguf --expert code \
+  --out "$PWD/artifacts/theia-code-f32.gguf" \
+  --round-out "$PWD/artifacts/theia-code-round.json"
+
+# Verified fallback config, no base file needed: --pinned-config
+# Defaults: rank 32, alpha 64, all 7 modules × 28 layers, F32 tensors.
+```
+
+**The generated weights are deterministic SplitMix64 internal-test seeds, NOT
+trained experts.** They only prove loadability and expert identity; a real
+trained adapter must replace them before any quality claim. Filenames say
+`f32` because the adapter tensors are F32, not the Q4_0 base.
+
+`--round-out` produces a deterministic SFT round derived from the adapter
+itself: `x` is seeded, `logits` are the LoRA delta `B(Ax) · alpha/rank`, and
+`target` is their argmax. This is a mechanical training-input example, not an
+evaluation result. See [docs/dllm-denoise.md](../docs/dllm-denoise.md#rq3-lora--gguf-factory-solved)
+for exact commands, artifact hashes and tests.
 
 ## Offline training CLI (production path)
 

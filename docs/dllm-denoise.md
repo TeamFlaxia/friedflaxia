@@ -6,10 +6,11 @@ implemented FriedFlaxia extension and what is still missing.
 
 > Status: the qwen3-dllm forward pass, block attention mask, full-logit and
 > top-k APIs, LoRA adapters, the wasm bindings, the native `DllmSession`
-> block/KV prefix cache, and the offline Rust training CLI are implemented.
-> Top-candidate parity against the pinned PyTorch checkpoint is validated on
-> the converted Q8_0 model; bit-exact BF16 logit parity and a real LoRA adapter
-> pin are still open.
+> block/KV prefix cache, the offline Rust training CLI, and the LoRA→GGUF
+> adapter factory (RQ3) are implemented. Top-candidate parity against the
+> pinned PyTorch checkpoint is validated on the converted Q8_0 model;
+> bit-exact BF16 logit parity and a *trained* expert adapter are still open.
+> Internal-test seed adapter pins are published on Hugging Face (see RQ3 below).
 
 ## Implemented
 
@@ -85,6 +86,74 @@ and an adapter that matches no modules are rejected at load time. A zero
 model, and `loraRank`/`loraExpert` expose its identity for node reporting and
 delta attribution.
 
+## RQ3: LoRA → GGUF factory (solved)
+
+`crates/friedflaxia-core/src/train/lora_factory.rs` builds a complete adapter
+with the Rust `Writer`; `crates/friedflaxia-core/examples/make_lora.rs` is its
+CLI. Shapes come from the **actual pinned base GGUF** by default (verified:
+`qwen3-dllm.block_count=28`, `embedding_length=1024`,
+`feed_forward_length=3072`, `head_count=16`, `head_count_kv=8`,
+`key_length=128`, vocab 151936 → `q_dim=2048`, `kv_dim=1024`). A documented
+`--pinned-config` fallback uses these verified constants without a local base.
+
+```sh
+# Obtain the pinned base from crates/friedflaxia-core/model-manifest.json.
+curl -L -o /tmp/base-qwen3-bd3lm-q4_0.gguf \
+  'https://huggingface.co/RemydreScarlet/qwen3-0.6b-diffusion-bd3lm-GGUF/resolve/fd3fb1978befe31cff16ab6cfcd4d5184cca0e9b/qwen3-bd3lm-q4_0.gguf'
+
+# Generate rank=32 / alpha=64 adapters, 7 modules × 28 layers, F32 tensors.
+cargo run --release -p friedflaxia-core --example make_lora -- \
+  --base /tmp/base-qwen3-bd3lm-q4_0.gguf --expert code \
+  --out "$PWD/artifacts/theia-code-f32.gguf" \
+  --round-out "$PWD/artifacts/theia-code-round.json"
+cargo run --release -p friedflaxia-core --example make_lora -- \
+  --base /tmp/base-qwen3-bd3lm-q4_0.gguf --expert math \
+  --out "$PWD/artifacts/theia-math-f32.gguf"
+cargo run --release -p friedflaxia-core --example make_lora -- \
+  --base /tmp/base-qwen3-bd3lm-q4_0.gguf --expert chat \
+  --out "$PWD/artifacts/theia-chat-f32.gguf"
+
+# Apply one offline SFT update (mechanical demo, see below).
+cargo run --release -p friedflaxia-train -- sft \
+  artifacts/theia-code-f32.gguf artifacts/theia-code-round.json \
+  artifacts/theia-code-sft-update-f32.gguf
+```
+
+**Warning: these weights are deterministic SplitMix64 internal-test seeds, not
+trained experts.** They prove the GGUF format, `LoraModel::from_gguf`, expert
+identity and the offline update path; they carry no quality claim. A real
+trained adapter must replace them before any evaluation or release. Filenames
+say `f32` because the adapter tensors are F32 (the *base* is Q4_0).
+
+`--round-out` writes a deterministic SFT round for `blk.0.attn_q`: `x` is a
+seeded normal vector, `logits` are the generated adapter's own LoRA delta
+(`alpha/rank · B(Ax)`), and `target` is the argmax of those synthetic logits.
+No base forward, reward model or evaluation produced them; the resulting
+`*-sft-update-*` file only demonstrates that the offline CLI performs a real
+AdamW step and re-serializes a loadable adapter.
+
+Local artifacts (absolute paths under
+`/home/remydre/flaxian/friedflaxia/artifacts/`, generated 2026-11-28). The three
+expert files are published at an immutable HF revision in
+`RemydreScarlet/theia-lora-adapters` and mirrored in Theia
+`model-dev/adapters.json`:
+
+| File | Bytes | SHA-256 |
+|---|---:|---|
+| `theia-code-f32.gguf` | 80767200 | `a051b00f8fc70c2506eded1cd91df8a54a4fb0592befd28a394d6dd9bd20e755` |
+| `theia-math-f32.gguf` | 80767200 | `e4b6e02df51dc06f9cd9179a0d7bad75ae9092ac840a73e921a4e3595aae4d3b` |
+| `theia-chat-f32.gguf` | 80767200 | `e58285ca4482343f8fa0f33a3e38667a158da74a2c69a394d945b15f114e9427` |
+| `theia-code-sft-update-f32.gguf` | 80767200 | `7795f2ecbacc1fc5042c5f6badd0a47c55766835f13c78c9e46a58fe0e6f3747` |
+| `theia-code-round.json` | 42140 | `124275db081f3f460d600f80f6489033e5743c57ae1769fa0607e162636ffd75` |
+
+`crates/friedflaxia-core/tests/lora_factory.rs` covers the production path:
+writer → GGUF parser → `LoraModel::from_gguf` (rank/alpha/expert/pair count),
+canonical names and shapes, determinism, the train-writer round trip, and
+`denoise_step_with_lora` (the core equivalent of `Model.withLora`). An ignored
+test checks the real pinned base and real artifacts via
+`FRIEDFLAXIA_DLLM_GGUF` / `FRIEDFLAXIA_LORA_GGUF` /
+`FRIEDFLAXIA_LORA_UPDATED_GGUF`.
+
 ## Offline training and the off-time policy
 
 **The production training path is Rust**: `friedflaxia-core` for GGUF IO and the
@@ -133,8 +202,8 @@ as its own process on its own schedule, outside inference traffic.
 |---|---|
 | `Model.withLora`, `loraRank()`, `loraExpert()` | implemented in Rust/wasm |
 | `THEIA_LORA_ADAPTERS` pins and `theia-expert-*` capability routing | implemented in Crowd |
-| LoRA adapter GGUF production (`qwen3-dllm-lora`) | implemented by the Rust `Writer` + train CLI |
-| Real LoRA GGUF artifact and actual pin values | **not configured yet** (only generated/synthetic adapters have been used) |
+| LoRA adapter GGUF production (`qwen3-dllm-lora`) | **solved (RQ3)**: Rust `Writer` + `lora_factory` + `make_lora` CLI + train CLI |
+| Real LoRA GGUF artifact and actual pin values | internal-test seed pins published on HF (`RemydreScarlet/theia-lora-adapters`, mirrored in Theia `model-dev/adapters.json`); **trained expert still open** |
 | Block/KV cache (`DllmSession`, native) | implemented |
 | PyTorch top-candidate parity (Q8_0) | validated; bit-exact BF16 parity not claimed |
 
@@ -174,7 +243,6 @@ residual order are used by both paths, so the synthetic F32 fixtures are
 bit-identical to the uncached oracle (SIMD on and off). When only one fresh row
 remains, the cached projection batch is padded with an unused row so the Q4_0
 `matvec`/`matmul` scalar accumulation orders cannot diverge.
-
 ## Still missing
 
 1. **SDAR self-conditioning.** QwenDLM's residual adapter is not implemented;

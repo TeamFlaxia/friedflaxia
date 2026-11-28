@@ -1,4 +1,5 @@
 /target
+/artifacts
 .cache
 crates/friedflaxia-wasm/pkg
 **/*.rs.bk

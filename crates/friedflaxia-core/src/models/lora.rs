@@ -78,7 +78,8 @@ impl LoraModule {
     }
 
     /// `(input dim, output dim)` of the base projection this module adapts.
-    fn dims(self, base: &DllmConfig) -> (usize, usize) {
+    /// Also used by the offline adapter factory to lay out its tensors.
+    pub fn dims(self, base: &DllmConfig) -> (usize, usize) {
         match self {
             Self::AttnQ => (base.n_embd, base.q_dim()),
             Self::AttnK | Self::AttnV => (base.n_embd, base.kv_dim()),
