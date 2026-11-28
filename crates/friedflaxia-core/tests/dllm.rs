@@ -532,6 +532,7 @@ fn argmax(row: &[f32]) -> usize {
 
 #[test]
 fn denoise_step_returns_logits_and_confidence() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let bytes = build_model(false);
     let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
     let out = denoise_step(&gguf, &bytes, &[1, 2, 3, 4], &[2, 3], (2, 4)).expect("denoise");
@@ -550,6 +551,7 @@ fn denoise_step_returns_logits_and_confidence() {
 
 #[test]
 fn denoise_step_is_deterministic() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let bytes = build_model(false);
     let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
     let first = denoise_step(&gguf, &bytes, &[1, 2, 3, 4], &[2, 3], (2, 4)).expect("first");
@@ -559,6 +561,7 @@ fn denoise_step_is_deterministic() {
 
 #[test]
 fn block_mask_hides_future_tokens() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let bytes = build_model(false);
     let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
     let base = denoise_step(&gguf, &bytes, &[1, 2, 3, 4], &[0, 1], (0, 2)).expect("base");
@@ -570,6 +573,7 @@ fn block_mask_hides_future_tokens() {
 
 #[test]
 fn block_mask_is_bidirectional_inside_the_block() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let bytes = build_model(false);
     let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
     let base = denoise_step(&gguf, &bytes, &[1, 2, 3, 4], &[0], (0, 2)).expect("base");
@@ -581,6 +585,7 @@ fn block_mask_is_bidirectional_inside_the_block() {
 
 #[test]
 fn block_mask_reads_the_clean_prefix() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let bytes = build_model(false);
     let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
     let base = denoise_step(&gguf, &bytes, &[1, 2, 3, 4], &[2, 3], (2, 4)).expect("base");
@@ -590,6 +595,7 @@ fn block_mask_reads_the_clean_prefix() {
 
 #[test]
 fn tied_output_projection_is_supported() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let bytes = build_model(true);
     let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
     let out = denoise_step(&gguf, &bytes, &[1, 2, 3, 4], &[2], (2, 4)).expect("tied output");
@@ -598,6 +604,7 @@ fn tied_output_projection_is_supported() {
 
 #[test]
 fn hardened_model_matches_golden_logits() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let bytes = build_hardened_model();
     let gguf = Gguf::parse(&bytes).expect("parse hardened dLLM");
     let tokens = [1, 2, 3, 4, 0, 1, 2, 3];
@@ -633,6 +640,7 @@ fn hardened_model_matches_golden_logits() {
 
 #[test]
 fn top_k_matches_the_full_distribution() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let bytes = build_model(false);
     let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
     let tokens = [1, 2, 3, 4];
@@ -658,6 +666,7 @@ fn top_k_matches_the_full_distribution() {
 
 #[test]
 fn future_tokens_are_not_read() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let bytes = build_model(false);
     let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
     let short = denoise_step(&gguf, &bytes, &[1, 2], &[0, 1], (0, 2)).expect("short");
@@ -667,6 +676,7 @@ fn future_tokens_are_not_read() {
 
 #[test]
 fn scoring_a_prefix_position_is_allowed() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let bytes = build_model(false);
     let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
     let out = denoise_step(&gguf, &bytes, &[1, 2, 3, 4], &[0], (2, 4)).expect("prefix score");
@@ -675,6 +685,7 @@ fn scoring_a_prefix_position_is_allowed() {
 
 #[test]
 fn zero_lora_matches_the_base_model() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let bytes = build_model(false);
     let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
     let config = base_config(&bytes);
@@ -692,6 +703,7 @@ fn zero_lora_matches_the_base_model() {
 
 #[test]
 fn nonzero_lora_changes_logits() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let bytes = build_model(false);
     let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
     let config = base_config(&bytes);
@@ -707,6 +719,7 @@ fn nonzero_lora_changes_logits() {
 
 #[test]
 fn zero_lora_topk_matches_the_base() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let bytes = build_model(false);
     let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
     let config = base_config(&bytes);
@@ -723,6 +736,7 @@ fn zero_lora_topk_matches_the_base() {
 
 #[test]
 fn lora_apply_matches_a_hand_computed_projection() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let base_bytes = build_model(false);
     let config = base_config(&base_bytes);
     let lora = lora_from(build_lora_fixed(4.0), &config);
@@ -736,6 +750,7 @@ fn lora_apply_matches_a_hand_computed_projection() {
 
 #[test]
 fn lora_applies_to_a_second_layer_ffn_down() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let bytes = build_hardened_model();
     let gguf = Gguf::parse(&bytes).expect("parse hardened dLLM");
     let config = base_config(&bytes);
@@ -752,6 +767,7 @@ fn lora_applies_to_a_second_layer_ffn_down() {
 
 #[test]
 fn lora_rejects_half_a_pair_and_bad_shapes() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let base_bytes = build_model(false);
     let config = base_config(&base_bytes);
 
@@ -766,6 +782,7 @@ fn lora_rejects_half_a_pair_and_bad_shapes() {
 
 #[test]
 fn lora_rejects_empty_unknown_and_extra_layers() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let base_bytes = build_model(false);
     let config = base_config(&base_bytes);
 
@@ -793,6 +810,7 @@ fn lora_rejects_empty_unknown_and_extra_layers() {
 
 #[test]
 fn lora_apply_ffn_down_layer_one_matches_hand_computed() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let base_bytes = build_hardened_model();
     let config = base_config(&base_bytes);
     let lora = lora_from(build_lora_fixed_ffn_down(4.0), &config);
@@ -817,6 +835,7 @@ fn lora_apply_ffn_down_layer_one_matches_hand_computed() {
 
 #[test]
 fn lora_rejects_misnamed_and_noncanonical_tensors() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let base_bytes = build_model(false);
     let config = base_config(&base_bytes);
 
@@ -834,6 +853,7 @@ fn lora_rejects_misnamed_and_noncanonical_tensors() {
 
 #[test]
 fn lora_rejects_offset_overflow() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let base_bytes = build_model(false);
     let config = base_config(&base_bytes);
     let bytes = build_lora_overflow_offset();
@@ -846,6 +866,7 @@ fn lora_rejects_offset_overflow() {
 
 #[test]
 fn lora_metadata_defaults_and_errors() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let base_bytes = build_model(false);
     let config = base_config(&base_bytes);
 
@@ -874,6 +895,7 @@ fn lora_metadata_defaults_and_errors() {
 
 #[test]
 fn rejects_invalid_inputs() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let bytes = build_model(false);
     let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
 
@@ -890,6 +912,7 @@ fn rejects_invalid_inputs() {
 
 #[test]
 fn fixture_tensors_are_f32() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let bytes = build_model(false);
     let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
     assert_eq!(gguf.tensor_count(), 14);
@@ -901,6 +924,7 @@ fn fixture_tensors_are_f32() {
 
 #[test]
 fn rejects_odd_head_dim() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let dims = ModelDims {
         n_layer: 1,
         n_embd: 6,
@@ -917,6 +941,7 @@ fn rejects_odd_head_dim() {
 
 #[test]
 fn rejects_missing_key_length_when_not_divisible() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let dims = ModelDims {
         n_layer: 1,
         n_embd: 7,
@@ -934,6 +959,7 @@ fn rejects_missing_key_length_when_not_divisible() {
 #[test]
 #[ignore = "requires FRIEDFLAXIA_DLLM_GGUF pointing at a qwen3-dllm GGUF"]
 fn real_dllm_denoise_smoke() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let Ok(path) = std::env::var("FRIEDFLAXIA_DLLM_GGUF") else {
         eprintln!("skipping: FRIEDFLAXIA_DLLM_GGUF is not set");
         return;
@@ -983,6 +1009,7 @@ fn real_dllm_denoise_smoke() {
 #[test]
 #[ignore = "requires FRIEDFLAXIA_DLLM_GGUF pointing at a qwen3-dllm GGUF"]
 fn real_dllm_cache_matches_uncached_q4_0() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let Ok(path) = std::env::var("FRIEDFLAXIA_DLLM_GGUF") else {
         eprintln!("skipping: FRIEDFLAXIA_DLLM_GGUF is not set");
         return;
@@ -998,10 +1025,11 @@ fn real_dllm_cache_matches_uncached_q4_0() {
     tokens[3] = 151_669;
 
     let mut session = DllmSession::new(&gguf, &bytes).expect("session");
-    // Step 1 commits no prefix (the whole step is one block). Step 2 advances
-    // the block past it, so the second `denoise_step` reuses eight cached rows.
-    // Step 3 moves the block backwards to a single fresh row, exercising the
-    // backwards-block truncation and the one-row Q4_0 matmul padding.
+    // Step 1 commits no prefix (the whole step is one block). Step 2 starts
+    // from that empty cache, commits rows [0..8), and its following top-k call
+    // reuses those eight cached rows. Step 3 moves the block backwards to a
+    // single fresh row, exercising warm-cache reuse, backwards-block
+    // truncation and the one-row Q4_0 matmul padding.
     let steps = [
         ((0, 8), vec![4, 5, 6]),
         ((8, 16), vec![12, 13, 14]),
@@ -1075,6 +1103,7 @@ fn logits_from_hidden(bytes: &[u8], gguf: &Gguf, config: &DllmConfig, hidden: &[
 
 #[test]
 fn hidden_at_is_the_vector_projected_by_denoise_step() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let bytes = build_hardened_model();
     let gguf = Gguf::parse(&bytes).expect("parse hardened dLLM");
     let config = base_config(&bytes);
@@ -1100,6 +1129,7 @@ fn hidden_at_is_the_vector_projected_by_denoise_step() {
 
 #[test]
 fn hidden_at_free_function_matches_the_model_method() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let bytes = build_model(false);
     let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
     let model = DllmModel::new(&gguf, &bytes).expect("model");
@@ -1111,6 +1141,7 @@ fn hidden_at_free_function_matches_the_model_method() {
 
 #[test]
 fn hidden_at_honours_the_block_mask() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let bytes = build_model(false);
     let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
     // A token at or after block_end cannot reach a query before block_end.
@@ -1126,6 +1157,7 @@ fn hidden_at_honours_the_block_mask() {
 
 #[test]
 fn hidden_at_validates_range_and_token_ids() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let bytes = build_model(false);
     let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
     assert!(hidden_at(&gguf, &bytes, &[], 0, 1, 0).is_err());
@@ -1139,6 +1171,7 @@ fn hidden_at_validates_range_and_token_ids() {
 
 #[test]
 fn hidden_at_rejects_non_finite_activations() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let dims = ModelDims::SIMPLE;
     let mut specs = model_specs(dims, false, true);
     let embedding = specs
@@ -1154,6 +1187,7 @@ fn hidden_at_rejects_non_finite_activations() {
 
 #[test]
 fn hidden_at_with_lora_changes_the_hidden_vector() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let bytes = build_model(false);
     let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
     let config = base_config(&bytes);
@@ -1168,6 +1202,7 @@ fn hidden_at_with_lora_changes_the_hidden_vector() {
 #[test]
 #[ignore = "requires FRIEDFLAXIA_DLLM_GGUF pointing at a qwen3-dllm GGUF"]
 fn real_dllm_hidden_at_smoke() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let Ok(path) = std::env::var("FRIEDFLAXIA_DLLM_GGUF") else {
         eprintln!("skipping: FRIEDFLAXIA_DLLM_GGUF is not set");
         return;
@@ -1218,6 +1253,7 @@ fn assert_topk_exact(actual: &DenoiseTopKOutput, expected: &DenoiseTopKOutput) {
 
 #[test]
 fn session_empty_cache_matches_free_step_exactly() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let bytes = build_model(false);
     let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
     let tokens = [1, 2, 3, 4];
@@ -1243,6 +1279,7 @@ fn session_empty_cache_matches_free_step_exactly() {
 
 #[test]
 fn session_warm_prefix_matches_free_step_exactly() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let bytes = build_hardened_model();
     let gguf = Gguf::parse(&bytes).expect("parse hardened dLLM");
     let tokens = [1, 2, 3, 4, 0, 2];
@@ -1268,6 +1305,7 @@ fn session_warm_prefix_matches_free_step_exactly() {
 
 #[test]
 fn session_gap_extension_matches_free_step_exactly() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let bytes = build_hardened_model();
     let gguf = Gguf::parse(&bytes).expect("parse hardened dLLM");
     let tokens = [1, 2, 3, 4, 0, 1];
@@ -1291,6 +1329,7 @@ fn session_gap_extension_matches_free_step_exactly() {
 
 #[test]
 fn session_prefix_token_mutation_invalidates() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let bytes = build_hardened_model();
     let gguf = Gguf::parse(&bytes).expect("parse hardened dLLM");
     let mut session = DllmSession::new(&gguf, &bytes).expect("session");
@@ -1320,6 +1359,7 @@ fn session_prefix_token_mutation_invalidates() {
 
 #[test]
 fn session_backwards_block_invalidates() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let bytes = build_hardened_model();
     let gguf = Gguf::parse(&bytes).expect("parse hardened dLLM");
     let tokens = [1, 2, 3, 4, 0, 1, 2, 3];
@@ -1340,6 +1380,7 @@ fn session_backwards_block_invalidates() {
 
 #[test]
 fn session_scores_prefix_positions_with_warm_cache() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let bytes = build_hardened_model();
     let gguf = Gguf::parse(&bytes).expect("parse hardened dLLM");
     let tokens = [1, 2, 3, 4, 0, 1];
@@ -1359,6 +1400,7 @@ fn session_scores_prefix_positions_with_warm_cache() {
 
 #[test]
 fn session_lora_switch_invalidates() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let bytes = build_model(false);
     let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
     let config = base_config(&bytes);
@@ -1402,6 +1444,7 @@ fn session_lora_switch_invalidates() {
 
 #[test]
 fn session_ignores_tail_with_warm_cache() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let bytes = build_hardened_model();
     let gguf = Gguf::parse(&bytes).expect("parse hardened dLLM");
     let tokens = [1, 2, 3, 4, 0, 1];
@@ -1425,6 +1468,7 @@ fn session_ignores_tail_with_warm_cache() {
 
 #[test]
 fn session_hardened_golden_logits_still_pass() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let bytes = build_hardened_model();
     let gguf = Gguf::parse(&bytes).expect("parse hardened dLLM");
     let tokens = [1, 2, 3, 4, 0, 1, 2, 3];
@@ -1459,6 +1503,7 @@ fn session_hardened_golden_logits_still_pass() {
 
 #[test]
 fn session_cache_is_untouched_on_error_and_clear_resets_it() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let bytes = build_hardened_model();
     let gguf = Gguf::parse(&bytes).expect("parse hardened dLLM");
     let tokens = [1, 2, 3, 4, 0, 1];
@@ -1574,6 +1619,7 @@ fn session_multi_step_differential_with_simd_on_and_off() {
 #[test]
 #[ignore = "requires FRIEDFLAXIA_DLLM_Q8_GGUF converted from the pinned HF checkpoint"]
 fn real_dllm_matches_pytorch_reference() {
+    let _simd_guard = CACHE_SIMD_LOCK.lock().unwrap();
     let Ok(path) = std::env::var("FRIEDFLAXIA_DLLM_Q8_GGUF") else {
         eprintln!("skipping: FRIEDFLAXIA_DLLM_Q8_GGUF is not set");
         return;
