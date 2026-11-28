@@ -1,11 +1,13 @@
-//! GGUF v3 writer for `qwen3-dllm-lora` adapters.
+//! GGUF v3 writer for `qwen3-dllm-lora` adapters and dLLM weights.
 //!
 //! The output is intentionally narrow: four LoRA metadata entries followed by
-//! F32 `lora_a` / `lora_b` tensors. The byte layout mirrors what the `Gguf`
-//! parser expects, including 32-byte alignment before the tensor data, so a
-//! freshly written adapter can be loaded without an extra conversion step.
+//! F32 `lora_a` / `lora_b` tensors, plus optional Q4_0 weight tensors. The byte
+//! layout mirrors what the `Gguf` parser expects, including 32-byte alignment
+//! before the tensor data, so a freshly written file can be loaded without an
+//! extra conversion step.
 
 use super::{TensorType, Value};
+use crate::quant::{QuantErrorKind, quantize_q4_0};
 use std::fmt;
 
 const MAGIC: &[u8; 4] = b"GGUF";
@@ -18,6 +20,10 @@ pub enum WriterError {
     ZeroRank,
     InvalidAlpha(f32),
     ValueCountMismatch,
+    /// Q4_0 needs complete 32-value blocks; carry the offending count.
+    UnalignedQ4_0(usize),
+    /// NaN/inf cannot be quantized into a finite GGML block.
+    NonFiniteValue,
     Overflow,
 }
 
@@ -29,6 +35,10 @@ impl fmt::Display for WriterError {
                 write!(f, "lora alpha must be finite and positive, got {alpha}")
             }
             Self::ValueCountMismatch => f.write_str("tensor value count does not match dims"),
+            Self::UnalignedQ4_0(count) => {
+                write!(f, "Q4_0 value count must be a multiple of 32, got {count}")
+            }
+            Self::NonFiniteValue => f.write_str("tensor contains a non-finite value"),
             Self::Overflow => f.write_str("GGUF size overflow"),
         }
     }
@@ -36,10 +46,27 @@ impl fmt::Display for WriterError {
 
 impl std::error::Error for WriterError {}
 
+/// On-disk encoding requested for a tensor added to the writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuantKind {
+    F32,
+    Q4_0,
+}
+
+impl QuantKind {
+    fn tensor_type(self) -> TensorType {
+        match self {
+            Self::F32 => TensorType::F32,
+            Self::Q4_0 => TensorType::Q4_0,
+        }
+    }
+}
+
 struct PendingTensor {
     name: String,
     dims: Vec<u64>,
-    /// F32 values in little-endian byte order.
+    kind: QuantKind,
+    /// Encoded tensor payload, ready to be appended to the data section.
     data: Vec<u8>,
 }
 
@@ -88,6 +115,22 @@ impl Writer {
         dims: &[u64],
         values: &[f32],
     ) -> Result<(), WriterError> {
+        self.add_quantized_tensor(name, dims, values, QuantKind::F32)
+    }
+
+    /// Append one tensor encoded as F32 or Q4_0 with GGML dimensions
+    /// `[cols, rows, ...]`.
+    ///
+    /// `values` must hold exactly `dims.iter().product()` elements. Q4_0
+    /// additionally requires that count to be a multiple of 32 and every value
+    /// to be finite; its payload is 18 bytes per 32 weights.
+    pub fn add_quantized_tensor(
+        &mut self,
+        name: &str,
+        dims: &[u64],
+        values: &[f32],
+        quant: QuantKind,
+    ) -> Result<(), WriterError> {
         let expected = dims.iter().try_fold(1usize, |acc, dim| {
             let dim = usize::try_from(*dim).map_err(|_| WriterError::Overflow)?;
             acc.checked_mul(dim).ok_or(WriterError::Overflow)
@@ -95,13 +138,23 @@ impl Writer {
         if expected != values.len() {
             return Err(WriterError::ValueCountMismatch);
         }
-        let mut data = Vec::with_capacity(values.len().saturating_mul(4));
-        for value in values {
-            data.extend_from_slice(&value.to_le_bytes());
-        }
+        let data = match quant {
+            QuantKind::F32 => {
+                let mut data = Vec::with_capacity(values.len().saturating_mul(4));
+                for value in values {
+                    data.extend_from_slice(&value.to_le_bytes());
+                }
+                data
+            }
+            QuantKind::Q4_0 => quantize_q4_0(values).map_err(|error| match error.kind {
+                QuantErrorKind::IncompleteBlock => WriterError::UnalignedQ4_0(values.len()),
+                QuantErrorKind::NonFiniteValue => WriterError::NonFiniteValue,
+            })?,
+        };
         self.tensors.push(PendingTensor {
             name: name.to_owned(),
             dims: dims.to_vec(),
+            kind: quant,
             data,
         });
         Ok(())
@@ -143,7 +196,7 @@ impl Writer {
             for dim in &tensor.dims {
                 out.extend_from_slice(&dim.to_le_bytes());
             }
-            put_u32(out, TensorType::F32.as_u32());
+            put_u32(out, tensor.kind.tensor_type().as_u32());
             out.extend_from_slice(&offset.to_le_bytes());
             offset += tensor.data.len() as u64;
         }

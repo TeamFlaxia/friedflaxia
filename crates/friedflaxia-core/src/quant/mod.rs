@@ -12,12 +12,12 @@ mod q6_k;
 mod q8_0;
 
 pub use bf16::dequantize_bf16;
-pub use f16::f16_to_f32;
+pub use f16::{f16_to_f32, f32_to_f16};
 pub use matvec::{
     MATMUL_TILE_TOKENS, MatvecError, matmul_q4_0, matmul_q8_0, matvec_bf16, matvec_f32,
     matvec_q4_0, matvec_q4_1, matvec_q6_k, matvec_q8_0,
 };
-pub use q4_0::dequantize_q4_0;
+pub use q4_0::{dequantize_q4_0, quantize_q4_0};
 pub use q4_1::dequantize_q4_1;
 pub use q6_k::dequantize_q6_k;
 pub use q8_0::dequantize_q8_0;
@@ -46,6 +46,8 @@ pub struct QuantError {
 pub enum QuantErrorKind {
     /// Input length is not a whole number of quant blocks.
     IncompleteBlock,
+    /// Quantization cannot represent a NaN or infinity.
+    NonFiniteValue,
 }
 
 impl QuantError {
@@ -62,6 +64,7 @@ impl fmt::Display for QuantError {
             QuantErrorKind::IncompleteBlock => {
                 f.write_str("quantized input contains an incomplete block")
             }
+            QuantErrorKind::NonFiniteValue => f.write_str("quantized values must be finite"),
         }
     }
 }
