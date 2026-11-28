@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/friedflaxia-core", "crates/friedflaxia-wasm"]
+members = ["crates/friedflaxia-core", "crates/friedflaxia-wasm", "crates/friedflaxia-train"]
 resolver = "2"
 
 [workspace.package]

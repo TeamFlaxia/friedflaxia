@@ -59,6 +59,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "friedflaxia-train"
+version = "0.1.0"
+dependencies = [
+ "friedflaxia-core",
+]
+
+[[package]]
 name = "friedflaxia-wasm"
 version = "0.1.0"
 dependencies = [
