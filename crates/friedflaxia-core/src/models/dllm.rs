@@ -197,11 +197,128 @@ fn run_backbone(
     lora: Option<&LoraModel>,
 ) -> Result<(DllmConfig, Vec<f32>), ModelError> {
     let config = DllmConfig::from_gguf(gguf)?;
-    validate_input(&config, tokens, positions, block)?;
+    let hidden = run_backbone_with_config(gguf, file, &config, tokens, positions, block, lora)?;
+    Ok((config, hidden))
+}
+
+/// The same preamble, with an already parsed config (for reusable handles).
+fn run_backbone_with_config(
+    gguf: &Gguf,
+    file: &[u8],
+    config: &DllmConfig,
+    tokens: &[u32],
+    positions: &[usize],
+    block: (usize, usize),
+    lora: Option<&LoraModel>,
+) -> Result<Vec<f32>, ModelError> {
+    validate_input(config, tokens, positions, block)?;
     // Tokens at or after block.1 cannot influence a query before block.1 under
     // the block mask, so the backbone only needs the prefix plus the block.
-    let hidden = forward_hidden(gguf, file, &config, &tokens[..block.1], block, lora)?;
-    Ok((config, hidden))
+    forward_hidden(gguf, file, config, &tokens[..block.1], block, lora)
+}
+
+/// A parsed dLLM GGUF plus its backing bytes, reusable across forwards.
+#[derive(Debug, Clone)]
+pub struct DllmModel<'a> {
+    gguf: &'a Gguf,
+    file: &'a [u8],
+    config: DllmConfig,
+}
+
+impl<'a> DllmModel<'a> {
+    pub fn new(gguf: &'a Gguf, file: &'a [u8]) -> Result<Self, ModelError> {
+        Ok(Self {
+            gguf,
+            file,
+            config: DllmConfig::from_gguf(gguf)?,
+        })
+    }
+
+    pub fn config(&self) -> &DllmConfig {
+        &self.config
+    }
+
+    /// Final hidden state at `position` from one base-model forward pass.
+    ///
+    /// See [`hidden_at`] for validation and masking semantics.
+    pub fn hidden_at(
+        &self,
+        tokens: &[u32],
+        block_start: usize,
+        block_end: usize,
+        position: usize,
+    ) -> Result<Vec<f32>, ModelError> {
+        self.hidden_at_with_lora(tokens, block_start, block_end, position, None)
+    }
+
+    /// Like [`DllmModel::hidden_at`], with an optional LoRA adapter.
+    pub fn hidden_at_with_lora(
+        &self,
+        tokens: &[u32],
+        block_start: usize,
+        block_end: usize,
+        position: usize,
+        lora: Option<&LoraModel>,
+    ) -> Result<Vec<f32>, ModelError> {
+        let hidden = run_backbone_with_config(
+            self.gguf,
+            self.file,
+            &self.config,
+            tokens,
+            &[position],
+            (block_start, block_end),
+            lora,
+        )?;
+        let width = self.config.n_embd;
+        let start = position
+            .checked_mul(width)
+            .ok_or_else(|| ModelError::Shape("dllm hidden offset".into()))?;
+        let end = start
+            .checked_add(width)
+            .ok_or_else(|| ModelError::Shape("dllm hidden offset".into()))?;
+        let row = hidden
+            .get(start..end)
+            .ok_or_else(|| ModelError::Shape("dllm hidden length".into()))?;
+        if row.iter().any(|value| !value.is_finite()) {
+            return Err(ModelError::Invalid("hidden activation is not finite"));
+        }
+        Ok(row.to_vec())
+    }
+}
+
+/// Final hidden state at one token position of a real GGUF base model.
+///
+/// Runs the same single block-masked forward as [`denoise_step`] and returns a
+/// copy of the requested `n_embd`-wide hidden vector (the vector fed to
+/// `output_norm` and the output projection, before either). Tokens at or after
+/// `block_end` are ignored, so callers must pass the whole canvas but only the
+/// prefix and active block are evaluated.
+///
+/// Requires `block_start < block_end <= tokens.len()` and
+/// `position < block_end`; every token id must be inside the vocabulary and
+/// every returned activation must be finite.
+pub fn hidden_at(
+    gguf: &Gguf,
+    file: &[u8],
+    tokens: &[u32],
+    block_start: usize,
+    block_end: usize,
+    position: usize,
+) -> Result<Vec<f32>, ModelError> {
+    hidden_at_with_lora(gguf, file, tokens, block_start, block_end, position, None)
+}
+
+/// Like [`hidden_at`], with an optional LoRA adapter applied to projections.
+pub fn hidden_at_with_lora(
+    gguf: &Gguf,
+    file: &[u8],
+    tokens: &[u32],
+    block_start: usize,
+    block_end: usize,
+    position: usize,
+    lora: Option<&LoraModel>,
+) -> Result<Vec<f32>, ModelError> {
+    DllmModel::new(gguf, file)?.hidden_at_with_lora(tokens, block_start, block_end, position, lora)
 }
 
 /// One denoising step over `tokens`, returning full logits for `positions`.

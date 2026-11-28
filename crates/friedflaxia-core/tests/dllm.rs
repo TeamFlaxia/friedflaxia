@@ -1,6 +1,7 @@
 use friedflaxia_core::gguf::{Gguf, TensorType};
 use friedflaxia_core::models::dllm::{
-    DllmConfig, denoise_step, denoise_step_with_lora, denoise_topk, denoise_topk_with_lora,
+    DllmConfig, DllmModel, denoise_step, denoise_step_with_lora, denoise_topk,
+    denoise_topk_with_lora, hidden_at, hidden_at_with_lora,
 };
 use friedflaxia_core::models::lora::{LoraModel, LoraModule};
 
@@ -975,4 +976,136 @@ fn real_dllm_denoise_smoke() {
         out.positions.len(),
         started.elapsed().as_millis()
     );
+}
+
+// No .gguf base model is checked in under tests/fixtures (only binary golden
+// outputs are). The hidden-state tests therefore build tiny F32 GGUF mock
+// models in memory with the helpers above; `real_dllm_hidden_at_smoke` below
+// exercises an actual GGUF when FRIEDFLAXIA_DLLM_GGUF is set.
+
+/// Recompute the output projection from a hidden vector using public ops so a
+/// hidden-state test can prove it is the very vector `denoise_step` consumes.
+fn logits_from_hidden(bytes: &[u8], gguf: &Gguf, config: &DllmConfig, hidden: &[f32]) -> Vec<f32> {
+    let norm = friedflaxia_core::tensor::tensor(gguf, bytes, "output_norm.weight")
+        .expect("output norm")
+        .vec()
+        .expect("norm values");
+    let normed = friedflaxia_core::ops::rms_norm(hidden, Some(&norm), config.eps);
+    let name = if gguf.tensor("output.weight").is_some() {
+        "output.weight"
+    } else {
+        "token_embd.weight"
+    };
+    friedflaxia_core::tensor::tensor(gguf, bytes, name)
+        .expect("output projection")
+        .matmul(&normed, 1)
+        .expect("logits")
+}
+
+#[test]
+fn hidden_at_is_the_vector_projected_by_denoise_step() {
+    let bytes = build_hardened_model();
+    let gguf = Gguf::parse(&bytes).expect("parse hardened dLLM");
+    let config = base_config(&bytes);
+    let model = DllmModel::new(&gguf, &bytes).expect("model");
+    let tokens = [1, 2, 3, 4, 0, 1, 2, 3];
+    let block = (0, 8);
+    let positions = [0, 4, 7];
+    let out = denoise_step(&gguf, &bytes, &tokens, &positions, block).expect("denoise");
+
+    for (row, position) in positions.iter().enumerate() {
+        let hidden = model
+            .hidden_at(&tokens, block.0, block.1, *position)
+            .expect("hidden");
+        assert_eq!(hidden.len(), config.n_embd);
+        assert!(hidden.iter().all(|value| value.is_finite()));
+        let expected = &out.logits[row * config.vocab_size..(row + 1) * config.vocab_size];
+        assert_close(
+            &logits_from_hidden(&bytes, &gguf, &config, &hidden),
+            expected,
+        );
+    }
+}
+
+#[test]
+fn hidden_at_free_function_matches_the_model_method() {
+    let bytes = build_model(false);
+    let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
+    let model = DllmModel::new(&gguf, &bytes).expect("model");
+    let tokens = [1, 2, 3, 4];
+    let direct = hidden_at(&gguf, &bytes, &tokens, 2, 4, 3).expect("free function");
+    let method = model.hidden_at(&tokens, 2, 4, 3).expect("method");
+    assert_close(&direct, &method);
+}
+
+#[test]
+fn hidden_at_honours_the_block_mask() {
+    let bytes = build_model(false);
+    let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
+    // A token at or after block_end cannot reach a query before block_end.
+    let base = hidden_at(&gguf, &bytes, &[1, 2, 3, 4], 0, 2, 0).expect("base");
+    let tail_changed = hidden_at(&gguf, &bytes, &[1, 2, 0, 4], 0, 2, 0).expect("tail changed");
+    assert_close(&base, &tail_changed);
+    // Inside the block attention is bidirectional, so a later block token is
+    // visible to an earlier query.
+    let base = hidden_at(&gguf, &bytes, &[1, 2, 3, 4], 0, 2, 0).expect("base");
+    let block_changed = hidden_at(&gguf, &bytes, &[1, 0, 3, 4], 0, 2, 0).expect("block changed");
+    assert_ne!(base, block_changed);
+}
+
+#[test]
+fn hidden_at_validates_range_and_token_ids() {
+    let bytes = build_model(false);
+    let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
+    assert!(hidden_at(&gguf, &bytes, &[], 0, 1, 0).is_err());
+    assert!(hidden_at(&gguf, &bytes, &[1, 2], 0, 0, 0).is_err());
+    assert!(hidden_at(&gguf, &bytes, &[2, 1], 2, 1, 0).is_err());
+    assert!(hidden_at(&gguf, &bytes, &[1, 2], 0, 3, 0).is_err());
+    assert!(hidden_at(&gguf, &bytes, &[1, 2], 0, 2, 2).is_err());
+    assert!(hidden_at(&gguf, &bytes, &[1, 2], 0, 2, 3).is_err());
+    assert!(hidden_at(&gguf, &bytes, &[1, 9], 0, 2, 0).is_err());
+}
+
+#[test]
+fn hidden_at_rejects_non_finite_activations() {
+    let dims = ModelDims::SIMPLE;
+    let mut specs = model_specs(dims, false, true);
+    let embedding = specs
+        .iter_mut()
+        .find(|spec| spec.name == "token_embd.weight")
+        .expect("embedding tensor");
+    embedding.values[0] = f32::NAN;
+    let bytes = build_gguf(specs, dims);
+    let gguf = Gguf::parse(&bytes).expect("parse NaN model");
+    let error = hidden_at(&gguf, &bytes, &[0, 1], 0, 2, 0).unwrap_err();
+    assert!(error.to_string().contains("finite"), "{error}");
+}
+
+#[test]
+fn hidden_at_with_lora_changes_the_hidden_vector() {
+    let bytes = build_model(false);
+    let gguf = Gguf::parse(&bytes).expect("parse tiny dLLM");
+    let config = base_config(&bytes);
+    let lora = lora_from(build_lora(0, 2, 2, 4.0, false, false), &config);
+    let tokens = [1, 2, 3, 4];
+    let base = hidden_at(&gguf, &bytes, &tokens, 2, 4, 2).expect("base");
+    let adapted = hidden_at_with_lora(&gguf, &bytes, &tokens, 2, 4, 2, Some(&lora)).expect("lora");
+    assert_ne!(base, adapted);
+    assert!(adapted.iter().all(|value| value.is_finite()));
+}
+
+#[test]
+#[ignore = "requires FRIEDFLAXIA_DLLM_GGUF pointing at a qwen3-dllm GGUF"]
+fn real_dllm_hidden_at_smoke() {
+    let Ok(path) = std::env::var("FRIEDFLAXIA_DLLM_GGUF") else {
+        eprintln!("skipping: FRIEDFLAXIA_DLLM_GGUF is not set");
+        return;
+    };
+    let bytes = std::fs::read(path).expect("read dLLM GGUF");
+    let gguf = Gguf::parse(&bytes).expect("parse dLLM GGUF");
+    let config = base_config(&bytes);
+    let tokens = vec![0; 8];
+    let hidden = hidden_at(&gguf, &bytes, &tokens, 0, 8, 7).expect("hidden");
+    assert_eq!(hidden.len(), config.n_embd);
+    assert!(hidden.iter().all(|value| value.is_finite()));
 }
