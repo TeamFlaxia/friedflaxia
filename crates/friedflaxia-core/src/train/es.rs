@@ -68,11 +68,7 @@ pub fn zscore(rewards: &[f32]) -> Vec<f32> {
 }
 
 /// Apply one ES step in place. Deterministic for a given seed/reward set.
-pub fn es_step(
-    weights: &mut [f32],
-    samples: &[EsSample],
-    config: EsConfig,
-) -> Result<(), EsError> {
+pub fn es_step(weights: &mut [f32], samples: &[EsSample], config: EsConfig) -> Result<(), EsError> {
     if weights.is_empty() {
         return Err(EsError::EmptyWeights);
     }
@@ -109,8 +105,14 @@ mod tests {
     fn zero_rewards_do_not_change_weights() {
         let mut weights = vec![0.1; 8];
         let samples = [
-            EsSample { seed: 1, reward: 0.0 },
-            EsSample { seed: 2, reward: 0.0 },
+            EsSample {
+                seed: 1,
+                reward: 0.0,
+            },
+            EsSample {
+                seed: 2,
+                reward: 0.0,
+            },
         ];
         es_step(&mut weights, &samples, EsConfig { alpha: 0.01 }).unwrap();
         assert_eq!(weights, vec![0.1; 8]);
@@ -148,9 +150,18 @@ mod tests {
     #[test]
     fn update_is_reproducible() {
         let samples = [
-            EsSample { seed: 3, reward: 1.0 },
-            EsSample { seed: 9, reward: -0.5 },
-            EsSample { seed: 12, reward: 0.25 },
+            EsSample {
+                seed: 3,
+                reward: 1.0,
+            },
+            EsSample {
+                seed: 9,
+                reward: -0.5,
+            },
+            EsSample {
+                seed: 12,
+                reward: 0.25,
+            },
         ];
         let mut a = vec![0.0; 32];
         let mut b = vec![0.0; 32];
@@ -164,7 +175,14 @@ mod tests {
     #[test]
     fn invalid_inputs_are_rejected() {
         assert_eq!(
-            es_step(&mut [], &[EsSample { seed: 1, reward: 1.0 }], EsConfig { alpha: 0.1 }),
+            es_step(
+                &mut [],
+                &[EsSample {
+                    seed: 1,
+                    reward: 1.0
+                }],
+                EsConfig { alpha: 0.1 }
+            ),
             Err(EsError::EmptyWeights)
         );
         assert_eq!(
@@ -172,13 +190,23 @@ mod tests {
             Err(EsError::EmptySamples)
         );
         assert_eq!(
-            es_step(&mut [0.0], &[EsSample { seed: 1, reward: 1.0 }], EsConfig { alpha: 0.0 }),
+            es_step(
+                &mut [0.0],
+                &[EsSample {
+                    seed: 1,
+                    reward: 1.0
+                }],
+                EsConfig { alpha: 0.0 }
+            ),
             Err(EsError::NonFiniteAlpha)
         );
         assert_eq!(
             es_step(
                 &mut [0.0],
-                &[EsSample { seed: 1, reward: f32::NAN }],
+                &[EsSample {
+                    seed: 1,
+                    reward: f32::NAN
+                }],
                 EsConfig { alpha: 0.1 }
             ),
             Err(EsError::NonFiniteReward)

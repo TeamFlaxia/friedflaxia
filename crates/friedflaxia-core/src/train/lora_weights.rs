@@ -7,8 +7,8 @@
 
 use crate::gguf::writer::{Writer, WriterError};
 use crate::gguf::{ConfigError, Gguf, GgufError, ModelConfig, TensorType};
-use crate::models::lora::{LoraModule, LORA_ARCHITECTURE};
-use crate::tensor::{tensor, TensorError};
+use crate::models::lora::{LORA_ARCHITECTURE, LoraModule};
+use crate::tensor::{TensorError, tensor};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt;
