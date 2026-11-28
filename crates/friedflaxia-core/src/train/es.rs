@@ -6,7 +6,7 @@
 
 use super::rng::SplitMix64;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EsSample {
     pub seed: u64,
     pub reward: f32,

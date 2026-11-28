@@ -3,12 +3,41 @@
 use friedflaxia_core::gguf::Gguf;
 use friedflaxia_core::train::es::{EsConfig, EsSample, es_step};
 use friedflaxia_core::train::lora_weights::LoraWeights;
+use serde::Deserialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CliError {
     InvalidSamples,
     InvalidAlpha,
     InvalidAdapter,
+}
+
+#[derive(Debug, Deserialize)]
+struct SampleJson {
+    seed: u64,
+    reward: f32,
+}
+
+#[derive(Debug, Deserialize)]
+struct RoundJson {
+    alpha: f32,
+    samples: Vec<SampleJson>,
+}
+
+fn parse_round(text: &str) -> Result<(f32, Vec<EsSample>), CliError> {
+    let round: RoundJson = serde_json::from_str(text).map_err(|_| CliError::InvalidSamples)?;
+    if round.samples.is_empty() {
+        return Err(CliError::InvalidSamples);
+    }
+    let samples = round
+        .samples
+        .into_iter()
+        .map(|sample| EsSample {
+            seed: sample.seed,
+            reward: sample.reward,
+        })
+        .collect();
+    Ok((round.alpha, samples))
 }
 
 fn es_update(
@@ -50,25 +79,14 @@ fn main() {
             std::process::exit(1);
         }
     };
-    // Minimal JSON: [{"seed": 1, "reward": 0.5}, ...]
-    let samples: Vec<EsSample> = samples_json
-        .trim()
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .split(',')
-        .filter(|entry| !entry.trim().is_empty())
-        .filter_map(|entry| {
-            let seed = entry.split("\"seed\"").nth(1)?.split(':').nth(1)?.trim().trim_end_matches(',').parse().ok()?;
-            let reward = entry.split("\"reward\"").nth(1)?.split(':').nth(1)?.trim().trim_end_matches('}').parse().ok()?;
-            Some(EsSample { seed, reward })
-        })
-        .collect();
-    if samples.is_empty() {
-        eprintln!("no valid samples");
-        std::process::exit(1);
-    }
-    // alpha is fixed by the offline recipe; it can be made a flag later.
-    match es_update(&adapter, &samples, 0.001) {
+    let (alpha, samples) = match parse_round(&samples_json) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            eprintln!("invalid round file: {error:?}");
+            std::process::exit(1);
+        }
+    };
+    match es_update(&adapter, &samples, alpha) {
         Ok(bytes) => {
             if let Err(error) = std::fs::write(&args[4], bytes) {
                 eprintln!("cannot write adapter: {error}");
@@ -97,6 +115,27 @@ mod tests {
             .add_tensor("blk.0.attn_q.lora_b.weight", &[2, 2], &[0.5, 0.6, 0.7, 0.8])
             .unwrap();
         writer.finish()
+    }
+
+    #[test]
+    fn parse_round_reads_alpha_and_samples() {
+        let (alpha, samples) = parse_round(
+            r#"{"alpha":0.002,"samples":[{"seed":1,"reward":0.5},{"seed":9,"reward":-0.25}]}"#,
+        )
+        .unwrap();
+        assert_eq!(alpha, 0.002);
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].seed, 1);
+        assert_eq!(samples[1].reward, -0.25);
+    }
+
+    #[test]
+    fn parse_round_rejects_malformed_or_empty_input() {
+        assert_eq!(parse_round("not json"), Err(CliError::InvalidSamples));
+        assert_eq!(
+            parse_round(r#"{"alpha":0.1,"samples":[]}"#),
+            Err(CliError::InvalidSamples)
+        );
     }
 
     #[test]
