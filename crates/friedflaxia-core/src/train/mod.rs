@@ -6,4 +6,5 @@
 
 pub mod autograd;
 pub mod es;
+pub mod lora_weights;
 pub mod rng;
