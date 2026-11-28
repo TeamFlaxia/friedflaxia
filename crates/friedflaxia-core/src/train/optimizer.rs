@@ -164,7 +164,8 @@ mod tests {
             let mut params = vec![0.5_f32, -0.5];
             let grads = vec![1.0_f32, bad];
             let mut opt = AdamW::new(params.len(), 0.05, 0.0);
-            opt.step(&mut vec![0.0; 2], &[1.0, 1.0]).unwrap(); // seed state
+            let mut seed = [0.0_f32; 2];
+            opt.step(&mut seed, &[1.0, 1.0]).unwrap(); // seed state
 
             let before_params = params.clone();
             let before_m = opt.m.clone();
