@@ -15,3 +15,4 @@ pub mod quant;
 pub mod simd;
 pub mod tensor;
 pub mod tokenizer;
+pub mod train;
