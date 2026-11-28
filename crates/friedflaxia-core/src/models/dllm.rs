@@ -17,7 +17,7 @@
 use super::ModelError;
 use super::lora::{LoraModel, LoraModule};
 use crate::gguf::{Gguf, ModelConfig};
-use crate::ops::{rms_norm, rms_norm_batch, rope_neox_inplace, silu};
+use crate::ops::{rms_norm, rms_norm_batch, rope_neox_inplace, silu, softmax_in_place};
 use crate::tensor::{TensorView, tensor};
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashSet};
@@ -286,6 +286,274 @@ impl<'a> DllmModel<'a> {
     }
 }
 
+/// Committed causal prefix of one denoising session.
+///
+/// `hidden` is row-major `[prefix_len][n_embd]`; `k`/`v` hold the post-norms,
+/// post-RoPE rows of every layer for the same positions. Only positions that
+/// were computed causally (strictly before their step's block start) are kept.
+#[derive(Debug, Clone)]
+struct PrefixCache {
+    tokens: Vec<u32>,
+    hidden: Vec<f32>,
+    k: Vec<Vec<f32>>,
+    v: Vec<Vec<f32>>,
+    /// Address of the adapter used for the committed rows. `None` means a
+    /// base-model step. An adapter switch must invalidate the whole cache.
+    lora: Option<usize>,
+}
+
+impl PrefixCache {
+    fn new(config: &DllmConfig, lora: Option<usize>) -> Self {
+        Self {
+            tokens: Vec::new(),
+            hidden: Vec::new(),
+            k: vec![Vec::new(); config.n_layer],
+            v: vec![Vec::new(); config.n_layer],
+            lora,
+        }
+    }
+
+    fn prefix_len(&self) -> usize {
+        self.tokens.len()
+    }
+}
+
+fn lora_identity(lora: Option<&LoraModel>) -> Option<usize> {
+    lora.map(|model| std::ptr::from_ref(model) as usize)
+}
+
+/// Reusable dLLM handle with a committed block/KV prefix cache.
+///
+/// The free functions stay the uncached differential oracle: a session's first
+/// step (and every step after an invalidation) produces bit-identical results.
+/// LoRA is still passed per step for the `*_with_lora` methods; a constructor
+/// bound adapter is simply the default for the plain methods, and its identity
+/// participates in cache invalidation.
+pub struct DllmSession<'a> {
+    gguf: &'a Gguf,
+    file: &'a [u8],
+    config: DllmConfig,
+    bound_lora: Option<&'a LoraModel>,
+    cache: PrefixCache,
+}
+
+impl<'a> DllmSession<'a> {
+    /// Parse the model once and start with an empty cache.
+    pub fn new(gguf: &'a Gguf, file: &'a [u8]) -> Result<Self, ModelError> {
+        Self::new_with_lora(gguf, file, None)
+    }
+
+    /// Like [`DllmSession::new`], with a default adapter for the plain methods.
+    pub fn with_lora(
+        gguf: &'a Gguf,
+        file: &'a [u8],
+        lora: &'a LoraModel,
+    ) -> Result<Self, ModelError> {
+        Self::new_with_lora(gguf, file, Some(lora))
+    }
+
+    /// Constructor with an optional default adapter.
+    pub fn new_with_lora(
+        gguf: &'a Gguf,
+        file: &'a [u8],
+        lora: Option<&'a LoraModel>,
+    ) -> Result<Self, ModelError> {
+        let config = DllmConfig::from_gguf(gguf)?;
+        let cache = PrefixCache::new(&config, lora_identity(lora));
+        Ok(Self {
+            gguf,
+            file,
+            config,
+            bound_lora: lora,
+            cache,
+        })
+    }
+
+    pub fn config(&self) -> &DllmConfig {
+        &self.config
+    }
+
+    /// Number of committed causal prefix positions.
+    pub fn prefix_len(&self) -> usize {
+        self.cache.prefix_len()
+    }
+
+    /// Drop every committed row (the adapter binding is kept).
+    pub fn clear(&mut self) {
+        self.cache = PrefixCache::new(&self.config, lora_identity(self.bound_lora));
+    }
+
+    /// Like [`denoise_step`], but reuses the committed prefix.
+    pub fn denoise_step(
+        &mut self,
+        tokens: &[u32],
+        positions: &[usize],
+        block: (usize, usize),
+    ) -> Result<DenoiseStepOutput, ModelError> {
+        let lora = self.bound_lora;
+        self.denoise_step_with_lora(tokens, positions, block, lora)
+    }
+
+    /// Like [`denoise_step_with_lora`], but reuses the committed prefix.
+    pub fn denoise_step_with_lora(
+        &mut self,
+        tokens: &[u32],
+        positions: &[usize],
+        block: (usize, usize),
+        lora: Option<&LoraModel>,
+    ) -> Result<DenoiseStepOutput, ModelError> {
+        validate_input(&self.config, tokens, positions, block)?;
+        let prefix = self.effective_prefix_len(tokens, block, lora);
+        let rows = forward_hidden_cached(
+            self.gguf,
+            self.file,
+            &self.config,
+            tokens,
+            block,
+            lora,
+            &self.cache,
+            prefix,
+        )?;
+        let logits = projected_logits(self.gguf, self.file, &self.config, &rows.hidden, positions)?;
+        let confidence = logits
+            .chunks_exact(self.config.vocab_size)
+            .map(|row| {
+                let (_, sum) = softmax_stats(row);
+                if sum > 0.0 { 1.0 / sum } else { 0.0 }
+            })
+            .collect();
+        let output = DenoiseStepOutput {
+            logits,
+            vocab_size: self.config.vocab_size,
+            positions: positions.to_vec(),
+            confidence,
+        };
+        self.commit(tokens, block, lora, prefix, &rows);
+        Ok(output)
+    }
+
+    /// Like [`denoise_topk`], but reuses the committed prefix.
+    pub fn denoise_topk(
+        &mut self,
+        tokens: &[u32],
+        positions: &[usize],
+        block: (usize, usize),
+        top_k: usize,
+    ) -> Result<DenoiseTopKOutput, ModelError> {
+        let lora = self.bound_lora;
+        self.denoise_topk_with_lora(tokens, positions, block, top_k, lora)
+    }
+
+    /// Like [`denoise_topk_with_lora`], but reuses the committed prefix.
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise_topk_with_lora(
+        &mut self,
+        tokens: &[u32],
+        positions: &[usize],
+        block: (usize, usize),
+        top_k: usize,
+        lora: Option<&LoraModel>,
+    ) -> Result<DenoiseTopKOutput, ModelError> {
+        if top_k == 0 {
+            return Err(ModelError::Invalid("top_k must be at least 1"));
+        }
+        validate_input(&self.config, tokens, positions, block)?;
+        let prefix = self.effective_prefix_len(tokens, block, lora);
+        let rows = forward_hidden_cached(
+            self.gguf,
+            self.file,
+            &self.config,
+            tokens,
+            block,
+            lora,
+            &self.cache,
+            prefix,
+        )?;
+        let logits = projected_logits(self.gguf, self.file, &self.config, &rows.hidden, positions)?;
+        let vocab_size = self.config.vocab_size;
+        let k = top_k.min(vocab_size);
+        let mut token_ids = Vec::with_capacity(positions.len() * k);
+        let mut probabilities = Vec::with_capacity(positions.len() * k);
+        let mut confidence = Vec::with_capacity(positions.len());
+
+        for row in logits.chunks_exact(vocab_size) {
+            let (max, sum) = softmax_stats(row);
+            confidence.push(if sum > 0.0 { 1.0 / sum } else { 0.0 });
+            for index in top_k_indices(row, k) {
+                token_ids.push(index as u32);
+                probabilities.push(if sum > 0.0 {
+                    (score(row, index) - max).exp() / sum
+                } else {
+                    0.0
+                });
+            }
+        }
+
+        let output = DenoiseTopKOutput {
+            positions: positions.to_vec(),
+            token_ids,
+            probabilities,
+            confidence,
+            vocab_size,
+            top_k: k,
+        };
+        self.commit(tokens, block, lora, prefix, &rows);
+        Ok(output)
+    }
+
+    /// Largest prefix that can safely be reused for this step. A changed
+    /// committed token truncates to that index, a backwards block truncates to
+    /// its start, and a LoRA identity change clears the prefix.
+    fn effective_prefix_len(
+        &self,
+        tokens: &[u32],
+        block: (usize, usize),
+        lora: Option<&LoraModel>,
+    ) -> usize {
+        if self.cache.lora != lora_identity(lora) {
+            return 0;
+        }
+        let mut prefix = self.cache.prefix_len().min(tokens.len());
+        if let Some(changed) = (0..prefix).find(|&index| tokens[index] != self.cache.tokens[index])
+        {
+            prefix = changed;
+        }
+        prefix.min(block.0)
+    }
+
+    /// Commit the causal rows `[prefix..block.0)` after every fallible step
+    /// operation has succeeded. Nothing is written on `ModelError`.
+    fn commit(
+        &mut self,
+        tokens: &[u32],
+        block: (usize, usize),
+        lora: Option<&LoraModel>,
+        prefix: usize,
+        rows: &ForwardRows,
+    ) {
+        let width = self.config.n_embd;
+        let kv_dim = self.config.kv_dim();
+        let new_prefix = block.0;
+        let added = new_prefix - prefix;
+        let mut cache = PrefixCache::new(&self.config, lora_identity(lora));
+        cache.tokens.extend_from_slice(&tokens[..new_prefix]);
+        cache
+            .hidden
+            .extend_from_slice(&rows.hidden[..new_prefix * width]);
+        for layer in 0..self.config.n_layer {
+            let mut k = Vec::with_capacity(new_prefix * kv_dim);
+            k.extend_from_slice(&self.cache.k[layer][..prefix * kv_dim]);
+            k.extend_from_slice(&rows.fresh_k[layer][..added * kv_dim]);
+            let mut v = Vec::with_capacity(new_prefix * kv_dim);
+            v.extend_from_slice(&self.cache.v[layer][..prefix * kv_dim]);
+            v.extend_from_slice(&rows.fresh_v[layer][..added * kv_dim]);
+            cache.k[layer] = k;
+            cache.v[layer] = v;
+        }
+        self.cache = cache;
+    }
+}
+
 /// Final hidden state at one token position of a real GGUF base model.
 ///
 /// Runs the same single block-masked forward as [`denoise_step`] and returns a
@@ -475,6 +743,335 @@ fn output_tensor<'a>(
     Ok(output)
 }
 
+struct Qkv {
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+}
+
+/// Output of a cached forward: the full hidden state plus the fresh K/V rows
+/// that a successful step may commit as new prefix.
+struct ForwardRows {
+    hidden: Vec<f32>,
+    fresh_k: Vec<Vec<f32>>,
+    fresh_v: Vec<Vec<f32>>,
+}
+
+/// Shape-checked tensors for one decoder layer. Both the uncached and the
+/// cached forward use these helpers, so a shape check cannot drift between them.
+struct LayerTensors<'a> {
+    index: usize,
+    name: String,
+    attn_norm: Vec<f32>,
+    wq: TensorView<'a>,
+    wk: TensorView<'a>,
+    wv: TensorView<'a>,
+    wo: TensorView<'a>,
+    q_norm: Vec<f32>,
+    k_norm: Vec<f32>,
+    ffn_norm: Vec<f32>,
+    ffn_gate: TensorView<'a>,
+    ffn_up: TensorView<'a>,
+    ffn_down: TensorView<'a>,
+}
+
+fn load_layer_tensors<'a>(
+    gguf: &'a Gguf,
+    file: &'a [u8],
+    config: &DllmConfig,
+    layer: usize,
+) -> Result<LayerTensors<'a>, ModelError> {
+    let name = format!("blk.{layer}");
+    let attn_norm = tensor(gguf, file, &format!("{name}.attn_norm.weight"))?.vec()?;
+    let wq = tensor(gguf, file, &format!("{name}.attn_q.weight"))?;
+    let wk = tensor(gguf, file, &format!("{name}.attn_k.weight"))?;
+    let wv = tensor(gguf, file, &format!("{name}.attn_v.weight"))?;
+    let wo = tensor(gguf, file, &format!("{name}.attn_output.weight"))?;
+    let q_norm = tensor(gguf, file, &format!("{name}.attn_q_norm.weight"))?.vec()?;
+    let k_norm = tensor(gguf, file, &format!("{name}.attn_k_norm.weight"))?.vec()?;
+    let ffn_norm = tensor(gguf, file, &format!("{name}.ffn_norm.weight"))?.vec()?;
+    let ffn_gate = tensor(gguf, file, &format!("{name}.ffn_gate.weight"))?;
+    let ffn_up = tensor(gguf, file, &format!("{name}.ffn_up.weight"))?;
+    let ffn_down = tensor(gguf, file, &format!("{name}.ffn_down.weight"))?;
+
+    let width = config.n_embd;
+    let q_dim = config.q_dim();
+    let kv_dim = config.kv_dim();
+    if attn_norm.len() != width || ffn_norm.len() != width {
+        return Err(ModelError::Shape(format!("{name} norm length")));
+    }
+    if q_norm.len() != config.head_dim || k_norm.len() != config.head_dim {
+        return Err(ModelError::Shape(format!("{name} q/k norm length")));
+    }
+    if wq.rows() != q_dim
+        || wq.cols() != width
+        || wk.rows() != kv_dim
+        || wk.cols() != width
+        || wv.rows() != kv_dim
+        || wv.cols() != width
+        || wo.rows() != width
+        || wo.cols() != q_dim
+    {
+        return Err(ModelError::Shape(format!("{name} attention shape")));
+    }
+    if ffn_gate.rows() != config.n_ff
+        || ffn_gate.cols() != width
+        || ffn_up.rows() != config.n_ff
+        || ffn_up.cols() != width
+        || ffn_down.rows() != width
+        || ffn_down.cols() != config.n_ff
+    {
+        return Err(ModelError::Shape(format!("{name} ffn shape")));
+    }
+
+    Ok(LayerTensors {
+        index: layer,
+        name,
+        attn_norm,
+        wq,
+        wk,
+        wv,
+        wo,
+        q_norm,
+        k_norm,
+        ffn_norm,
+        ffn_gate,
+        ffn_up,
+        ffn_down,
+    })
+}
+
+/// The block-diffusion mask: queries in `[block.0, block.1)` see the whole
+/// block; every earlier query is causal. Tokens at or after `block.1` are
+/// outside the backbone and never reach this function.
+#[inline]
+fn block_key_end(query: usize, block: (usize, usize)) -> usize {
+    if query >= block.0 && query < block.1 {
+        block.1
+    } else {
+        query + 1
+    }
+}
+
+/// q/k/v projections, LoRA adapters, per-head q/k norm and NeoX RoPE.
+///
+/// `normed` holds `batch` rows: the caller's real rows plus, in the cached
+/// path, an optional unused padding row that keeps the matmul batch shape (and
+/// therefore its arithmetic) identical to the uncached path.
+fn project_qkv(
+    layer: &LayerTensors<'_>,
+    config: &DllmConfig,
+    normed: &[f32],
+    batch: usize,
+    lora: Option<&LoraModel>,
+) -> Result<Qkv, ModelError> {
+    let q_dim = config.q_dim();
+    let kv_dim = config.kv_dim();
+    let mut q = layer.wq.matmul(normed, batch)?;
+    let mut k = layer.wk.matmul(normed, batch)?;
+    let mut v = layer.wv.matmul(normed, batch)?;
+    if let Some(lora) = lora {
+        lora.apply(layer.index, LoraModule::AttnQ, normed, batch, &mut q)?;
+        lora.apply(layer.index, LoraModule::AttnK, normed, batch, &mut k)?;
+        lora.apply(layer.index, LoraModule::AttnV, normed, batch, &mut v)?;
+    }
+    if q.len() != batch * q_dim || k.len() != batch * kv_dim || v.len() != batch * kv_dim {
+        return Err(ModelError::Shape(format!(
+            "{} projection length",
+            layer.name
+        )));
+    }
+    Ok(Qkv { q, k, v })
+}
+
+fn normalize_and_rope_qk(
+    config: &DllmConfig,
+    layer: &LayerTensors<'_>,
+    q: &mut [f32],
+    k: &mut [f32],
+    first_position: usize,
+    rows: usize,
+) {
+    let q_dim = config.q_dim();
+    let kv_dim = config.kv_dim();
+    for local in 0..rows {
+        let position = first_position + local;
+        let q_row = &mut q[local * q_dim..(local + 1) * q_dim];
+        for head in 0..config.n_head {
+            let start = head * config.head_dim;
+            let value = rms_norm(
+                &q_row[start..start + config.head_dim],
+                Some(&layer.q_norm),
+                config.eps,
+            );
+            q_row[start..start + config.head_dim].copy_from_slice(&value);
+        }
+        rope_neox_inplace(
+            q_row,
+            config.n_head,
+            config.head_dim,
+            position,
+            config.rope_freq_base,
+        );
+
+        let k_row = &mut k[local * kv_dim..(local + 1) * kv_dim];
+        for head in 0..config.n_head_kv {
+            let start = head * config.head_dim;
+            let value = rms_norm(
+                &k_row[start..start + config.head_dim],
+                Some(&layer.k_norm),
+                config.eps,
+            );
+            k_row[start..start + config.head_dim].copy_from_slice(&value);
+        }
+        rope_neox_inplace(
+            k_row,
+            config.n_head_kv,
+            config.head_dim,
+            position,
+            config.rope_freq_base,
+        );
+    }
+}
+
+/// The one attention routine. `fresh_start` is the absolute position of row 0
+/// in `q`/`k`/`v`; earlier keys/values come from the committed prefix cache.
+/// Uncached calls pass `fresh_start = 0` and empty prefix slices.
+#[allow(clippy::too_many_arguments)]
+fn attention_round(
+    config: &DllmConfig,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    prefix_k: &[f32],
+    prefix_v: &[f32],
+    fresh_start: usize,
+    query_start: usize,
+    query_end: usize,
+    block: (usize, usize),
+    concat: &mut [f32],
+    scores: &mut Vec<f32>,
+) {
+    let q_dim = config.q_dim();
+    let kv_dim = config.kv_dim();
+    let scale = 1.0 / (config.head_dim as f32).sqrt();
+    concat.fill(0.0);
+    for query in query_start..query_end {
+        let local_query = query - fresh_start;
+        // The active block is bidirectional; everything else is causal.
+        let key_end = block_key_end(query, block);
+        for head in 0..config.n_head {
+            let kv_head = head / (config.n_head / config.n_head_kv);
+            let q_head = &q[local_query * q_dim + head * config.head_dim
+                ..local_query * q_dim + (head + 1) * config.head_dim];
+            scores.clear();
+            scores.extend((0..key_end).map(|other| {
+                let key = if other < fresh_start {
+                    &prefix_k[other * kv_dim + kv_head * config.head_dim
+                        ..other * kv_dim + (kv_head + 1) * config.head_dim]
+                } else {
+                    let row = other - fresh_start;
+                    &k[row * kv_dim + kv_head * config.head_dim
+                        ..row * kv_dim + (kv_head + 1) * config.head_dim]
+                };
+                crate::simd::dot(q_head, key) * scale
+            }));
+            softmax_in_place(scores);
+            let out = &mut concat[local_query * q_dim + head * config.head_dim
+                ..local_query * q_dim + (head + 1) * config.head_dim];
+            for (weight, other) in scores.iter().zip(0..key_end) {
+                let value = if other < fresh_start {
+                    &prefix_v[other * kv_dim + kv_head * config.head_dim
+                        ..other * kv_dim + (kv_head + 1) * config.head_dim]
+                } else {
+                    let row = other - fresh_start;
+                    &v[row * kv_dim + kv_head * config.head_dim
+                        ..row * kv_dim + (kv_head + 1) * config.head_dim]
+                };
+                for (index, value) in value.iter().enumerate() {
+                    out[index] += weight * value;
+                }
+            }
+        }
+    }
+}
+
+/// Attention projection, LoRA and residual add. `hidden` is the slice of rows
+/// this call owns (all rows uncached, only the fresh rows cached).
+fn apply_attention_output(
+    layer: &LayerTensors<'_>,
+    config: &DllmConfig,
+    concat: &[f32],
+    batch: usize,
+    hidden: &mut [f32],
+    lora: Option<&LoraModel>,
+) -> Result<(), ModelError> {
+    let mut projected = layer.wo.matmul(concat, batch)?;
+    if let Some(lora) = lora {
+        lora.apply(
+            layer.index,
+            LoraModule::AttnOutput,
+            concat,
+            batch,
+            &mut projected,
+        )?;
+    }
+    if projected.len() != hidden.len() {
+        return Err(ModelError::Shape(format!(
+            "{} attention output",
+            layer.name
+        )));
+    }
+    for (value, add) in hidden.iter_mut().zip(&projected) {
+        *value += add;
+    }
+    debug_assert_eq!(batch * config.n_embd, hidden.len());
+    Ok(())
+}
+
+/// SwiGLU FFN, LoRA and residual add, in the same order as the original pass.
+fn apply_ffn(
+    layer: &LayerTensors<'_>,
+    config: &DllmConfig,
+    hidden: &mut [f32],
+    batch: usize,
+    activated: &mut [f32],
+    lora: Option<&LoraModel>,
+) -> Result<(), ModelError> {
+    let width = config.n_embd;
+    let ffn_in = rms_norm_batch(hidden, batch, width, Some(&layer.ffn_norm), config.eps);
+    let mut gate = layer.ffn_gate.matmul(&ffn_in, batch)?;
+    let mut up = layer.ffn_up.matmul(&ffn_in, batch)?;
+    if let Some(lora) = lora {
+        lora.apply(layer.index, LoraModule::FfnGate, &ffn_in, batch, &mut gate)?;
+        lora.apply(layer.index, LoraModule::FfnUp, &ffn_in, batch, &mut up)?;
+    }
+    for (index, (gate, up)) in gate.iter().zip(&up).enumerate() {
+        activated[index] = silu(*gate) * up;
+    }
+    let mut down = layer.ffn_down.matmul(activated, batch)?;
+    if let Some(lora) = lora {
+        lora.apply(
+            layer.index,
+            LoraModule::FfnDown,
+            activated,
+            batch,
+            &mut down,
+        )?;
+    }
+    if down.len() != hidden.len() {
+        return Err(ModelError::Shape(format!("{} ffn output", layer.name)));
+    }
+    for (value, add) in hidden.iter_mut().zip(&down) {
+        *value += add;
+    }
+    debug_assert_eq!(batch * config.n_embd, hidden.len());
+    Ok(())
+}
+
+/// Full block-masked forward, used by the original free functions. Its
+/// arithmetic and output are unchanged by the cache work; all per-layer work
+/// now goes through the helpers shared with `forward_hidden_cached`.
 fn forward_hidden(
     gguf: &Gguf,
     file: &[u8],
@@ -486,7 +1083,6 @@ fn forward_hidden(
     let width = config.n_embd;
     let n = tokens.len();
     let q_dim = config.q_dim();
-    let kv_dim = config.kv_dim();
     let token_embd = tensor(gguf, file, "token_embd.weight")?;
     if token_embd.cols() != width {
         return Err(ModelError::Shape("token_embd columns".into()));
@@ -497,166 +1093,127 @@ fn forward_hidden(
     }
     let mut concat = vec![0.0f32; n * q_dim];
     let mut activated = vec![0.0f32; n * config.n_ff];
+    let mut scores: Vec<f32> = Vec::new();
 
     for layer in 0..config.n_layer {
-        let prefix = format!("blk.{layer}");
-        let attn_norm = tensor(gguf, file, &format!("{prefix}.attn_norm.weight"))?.vec()?;
-        let wq = tensor(gguf, file, &format!("{prefix}.attn_q.weight"))?;
-        let wk = tensor(gguf, file, &format!("{prefix}.attn_k.weight"))?;
-        let wv = tensor(gguf, file, &format!("{prefix}.attn_v.weight"))?;
-        let wo = tensor(gguf, file, &format!("{prefix}.attn_output.weight"))?;
-        let q_norm = tensor(gguf, file, &format!("{prefix}.attn_q_norm.weight"))?.vec()?;
-        let k_norm = tensor(gguf, file, &format!("{prefix}.attn_k_norm.weight"))?.vec()?;
-        let ffn_norm = tensor(gguf, file, &format!("{prefix}.ffn_norm.weight"))?.vec()?;
-        let ffn_gate = tensor(gguf, file, &format!("{prefix}.ffn_gate.weight"))?;
-        let ffn_up = tensor(gguf, file, &format!("{prefix}.ffn_up.weight"))?;
-        let ffn_down = tensor(gguf, file, &format!("{prefix}.ffn_down.weight"))?;
-
-        if attn_norm.len() != width || ffn_norm.len() != width {
-            return Err(ModelError::Shape(format!("{prefix} norm length")));
-        }
-        if q_norm.len() != config.head_dim || k_norm.len() != config.head_dim {
-            return Err(ModelError::Shape(format!("{prefix} q/k norm length")));
-        }
-        if wq.rows() != q_dim
-            || wq.cols() != width
-            || wk.rows() != kv_dim
-            || wk.cols() != width
-            || wv.rows() != kv_dim
-            || wv.cols() != width
-            || wo.rows() != width
-            || wo.cols() != q_dim
-        {
-            return Err(ModelError::Shape(format!("{prefix} attention shape")));
-        }
-        if ffn_gate.rows() != config.n_ff
-            || ffn_gate.cols() != width
-            || ffn_up.rows() != config.n_ff
-            || ffn_up.cols() != width
-            || ffn_down.rows() != width
-            || ffn_down.cols() != config.n_ff
-        {
-            return Err(ModelError::Shape(format!("{prefix} ffn shape")));
-        }
-
-        let normed = rms_norm_batch(&hidden, n, width, Some(&attn_norm), config.eps);
-        let mut q = wq.matmul(&normed, n)?;
-        let mut k = wk.matmul(&normed, n)?;
-        let mut v = wv.matmul(&normed, n)?;
-        if let Some(lora) = lora {
-            lora.apply(layer, LoraModule::AttnQ, &normed, n, &mut q)?;
-            lora.apply(layer, LoraModule::AttnK, &normed, n, &mut k)?;
-            lora.apply(layer, LoraModule::AttnV, &normed, n, &mut v)?;
-        }
-        if q.len() != n * q_dim || k.len() != n * kv_dim || v.len() != n * kv_dim {
-            return Err(ModelError::Shape(format!("{prefix} projection length")));
-        }
-
-        for position in 0..n {
-            let q_row = &mut q[position * q_dim..(position + 1) * q_dim];
-            for head in 0..config.n_head {
-                let start = head * config.head_dim;
-                let value = rms_norm(
-                    &q_row[start..start + config.head_dim],
-                    Some(&q_norm),
-                    config.eps,
-                );
-                q_row[start..start + config.head_dim].copy_from_slice(&value);
-            }
-            rope_neox_inplace(
-                q_row,
-                config.n_head,
-                config.head_dim,
-                position,
-                config.rope_freq_base,
-            );
-
-            let k_row = &mut k[position * kv_dim..(position + 1) * kv_dim];
-            for head in 0..config.n_head_kv {
-                let start = head * config.head_dim;
-                let value = rms_norm(
-                    &k_row[start..start + config.head_dim],
-                    Some(&k_norm),
-                    config.eps,
-                );
-                k_row[start..start + config.head_dim].copy_from_slice(&value);
-            }
-            rope_neox_inplace(
-                k_row,
-                config.n_head_kv,
-                config.head_dim,
-                position,
-                config.rope_freq_base,
-            );
-        }
-
-        let scale = 1.0 / (config.head_dim as f32).sqrt();
-        concat.fill(0.0);
-        let mut scores: Vec<f32> = Vec::new();
-        for query in 0..n {
-            // The active block is bidirectional; everything else is causal.
-            let key_end = if query >= block.0 && query < block.1 {
-                block.1
-            } else {
-                query + 1
-            };
-            for head in 0..config.n_head {
-                let kv_head = head / (config.n_head / config.n_head_kv);
-                let q_head = &q[query * q_dim + head * config.head_dim
-                    ..query * q_dim + (head + 1) * config.head_dim];
-                scores.clear();
-                scores.extend((0..key_end).map(|other| {
-                    let key = &k[other * kv_dim + kv_head * config.head_dim
-                        ..other * kv_dim + (kv_head + 1) * config.head_dim];
-                    crate::simd::dot(q_head, key) * scale
-                }));
-                crate::ops::softmax_in_place(&mut scores);
-                let out = &mut concat[query * q_dim + head * config.head_dim
-                    ..query * q_dim + (head + 1) * config.head_dim];
-                for (weight, other) in scores.iter().zip(0..key_end) {
-                    let value = &v[other * kv_dim + kv_head * config.head_dim
-                        ..other * kv_dim + (kv_head + 1) * config.head_dim];
-                    for (index, value) in value.iter().enumerate() {
-                        out[index] += weight * value;
-                    }
-                }
-            }
-        }
-
-        let mut projected = wo.matmul(&concat, n)?;
-        if let Some(lora) = lora {
-            lora.apply(layer, LoraModule::AttnOutput, &concat, n, &mut projected)?;
-        }
-        if projected.len() != hidden.len() {
-            return Err(ModelError::Shape(format!("{prefix} attention output")));
-        }
-        for (value, add) in hidden.iter_mut().zip(&projected) {
-            *value += add;
-        }
-
-        let ffn_in = rms_norm_batch(&hidden, n, width, Some(&ffn_norm), config.eps);
-        let mut gate = ffn_gate.matmul(&ffn_in, n)?;
-        let mut up = ffn_up.matmul(&ffn_in, n)?;
-        if let Some(lora) = lora {
-            lora.apply(layer, LoraModule::FfnGate, &ffn_in, n, &mut gate)?;
-            lora.apply(layer, LoraModule::FfnUp, &ffn_in, n, &mut up)?;
-        }
-        for (index, (gate, up)) in gate.iter().zip(&up).enumerate() {
-            activated[index] = silu(*gate) * up;
-        }
-        let mut down = ffn_down.matmul(&activated, n)?;
-        if let Some(lora) = lora {
-            lora.apply(layer, LoraModule::FfnDown, &activated, n, &mut down)?;
-        }
-        if down.len() != hidden.len() {
-            return Err(ModelError::Shape(format!("{prefix} ffn output")));
-        }
-        for (value, add) in hidden.iter_mut().zip(&down) {
-            *value += add;
-        }
+        let tensors = load_layer_tensors(gguf, file, config, layer)?;
+        let normed = rms_norm_batch(&hidden, n, width, Some(&tensors.attn_norm), config.eps);
+        let Qkv { mut q, mut k, v } = project_qkv(&tensors, config, &normed, n, lora)?;
+        normalize_and_rope_qk(config, &tensors, &mut q, &mut k, 0, n);
+        attention_round(
+            config,
+            &q,
+            &k,
+            &v,
+            &[],
+            &[],
+            0,
+            0,
+            n,
+            block,
+            &mut concat,
+            &mut scores,
+        );
+        apply_attention_output(&tensors, config, &concat, n, &mut hidden, lora)?;
+        apply_ffn(&tensors, config, &mut hidden, n, &mut activated, lora)?;
     }
 
     Ok(hidden)
+}
+
+/// Cached forward. Only rows `[prefix..block.1)` are projected and attended;
+/// the committed prefix contributes its cached final hidden rows and its
+/// per-layer post-RoPE K/V rows. Returns the full hidden state plus the fresh
+/// K/V rows so the caller can commit the new prefix after all fallible work.
+#[allow(clippy::too_many_arguments)]
+fn forward_hidden_cached(
+    gguf: &Gguf,
+    file: &[u8],
+    config: &DllmConfig,
+    tokens: &[u32],
+    block: (usize, usize),
+    lora: Option<&LoraModel>,
+    cache: &PrefixCache,
+    prefix: usize,
+) -> Result<ForwardRows, ModelError> {
+    let width = config.n_embd;
+    let n = block.1;
+    let rows = n - prefix;
+    // `TensorView::matmul(n_tokens == 1)` calls `matvec`, while larger batches
+    // use the batched kernel. Q4_0's scalar paths accumulate in a different
+    // order, so pad a single fresh row when the uncached pass would have used
+    // a batch. The extra row is never read or committed; it only keeps both
+    // paths bit-identical, including with SIMD disabled.
+    let batch = if rows == 1 && n > 1 { 2 } else { rows };
+    let q_dim = config.q_dim();
+    let kv_dim = config.kv_dim();
+    let token_embd = tensor(gguf, file, "token_embd.weight")?;
+    if token_embd.cols() != width {
+        return Err(ModelError::Shape("token_embd columns".into()));
+    }
+    let mut hidden = Vec::with_capacity((prefix + batch) * width);
+    hidden.extend_from_slice(&cache.hidden[..prefix * width]);
+    for token in &tokens[prefix..n] {
+        hidden.extend_from_slice(&token_embd.row_vec(*token as usize)?);
+    }
+    hidden.resize((prefix + batch) * width, 0.0);
+    let mut concat = vec![0.0f32; batch * q_dim];
+    let mut activated = vec![0.0f32; batch * config.n_ff];
+    let mut scores: Vec<f32> = Vec::new();
+    let mut fresh_k = vec![vec![0.0f32; rows * kv_dim]; config.n_layer];
+    let mut fresh_v = vec![vec![0.0f32; rows * kv_dim]; config.n_layer];
+
+    for layer in 0..config.n_layer {
+        let tensors = load_layer_tensors(gguf, file, config, layer)?;
+        let normed = rms_norm_batch(
+            &hidden[prefix * width..],
+            batch,
+            width,
+            Some(&tensors.attn_norm),
+            config.eps,
+        );
+        let Qkv { mut q, mut k, v } = project_qkv(&tensors, config, &normed, batch, lora)?;
+        normalize_and_rope_qk(config, &tensors, &mut q, &mut k, prefix, rows);
+        fresh_k[layer].copy_from_slice(&k[..rows * kv_dim]);
+        fresh_v[layer].copy_from_slice(&v[..rows * kv_dim]);
+        attention_round(
+            config,
+            &q,
+            &k,
+            &v,
+            &cache.k[layer][..prefix * kv_dim],
+            &cache.v[layer][..prefix * kv_dim],
+            prefix,
+            prefix,
+            n,
+            block,
+            &mut concat,
+            &mut scores,
+        );
+        apply_attention_output(
+            &tensors,
+            config,
+            &concat,
+            batch,
+            &mut hidden[prefix * width..],
+            lora,
+        )?;
+        apply_ffn(
+            &tensors,
+            config,
+            &mut hidden[prefix * width..],
+            batch,
+            &mut activated,
+            lora,
+        )?;
+    }
+    hidden.truncate(n * width);
+
+    Ok(ForwardRows {
+        hidden,
+        fresh_k,
+        fresh_v,
+    })
 }
 
 /// Max logit and the softmax denominator. NaN logits are ignored; a row with

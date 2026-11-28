@@ -5,9 +5,11 @@ nodes and merges their per-position token distributions. This note records the
 implemented FriedFlaxia extension and what is still missing.
 
 > Status: the qwen3-dllm forward pass, block attention mask, full-logit and
-> top-k APIs, LoRA adapters, the wasm bindings, and the offline Rust training
-> CLI are implemented. A block/KV cache, real-model parity and a real LoRA
-> adapter pin are next.
+> top-k APIs, LoRA adapters, the wasm bindings, the native `DllmSession`
+> block/KV prefix cache, and the offline Rust training CLI are implemented.
+> Top-candidate parity against the pinned PyTorch checkpoint is validated on
+> the converted Q8_0 model; bit-exact BF16 logit parity and a real LoRA adapter
+> pin are still open.
 
 ## Implemented
 
@@ -30,6 +32,11 @@ implemented FriedFlaxia extension and what is still missing.
   checked before any tensor is read. Positions may be anywhere before `end`
   (including the clean prefix), because the tail is the only part that is not
   computed.
+- **Native block/KV prefix cache.** `DllmSession` keeps the committed causal
+  prefix's final hidden rows and per-layer post-RoPE K/V rows. Each step runs
+  the backbone only over `[previous_prefix, end)`; the free functions remain the
+  uncached differential oracle. See [Block/KV cache](#blockkv-cache) below. The
+  session is native-only; no wasm binding was added.
 
 The wasm `Model` exposes both entry points:
 
@@ -128,22 +135,56 @@ as its own process on its own schedule, outside inference traffic.
 | `THEIA_LORA_ADAPTERS` pins and `theia-expert-*` capability routing | implemented in Crowd |
 | LoRA adapter GGUF production (`qwen3-dllm-lora`) | implemented by the Rust `Writer` + train CLI |
 | Real LoRA GGUF artifact and actual pin values | **not configured yet** (only generated/synthetic adapters have been used) |
-| Block/KV cache, PyTorch logit parity | still open |
+| Block/KV cache (`DllmSession`, native) | implemented |
+| PyTorch top-candidate parity (Q8_0) | validated; bit-exact BF16 parity not claimed |
+
+## Block/KV cache
+
+`DllmSession` parses the GGUF once and owns a committed prefix:
+
+- `tokens[..P]` — the token ids the cached rows were computed from,
+- `hidden[..P]` — final `n_embd`-wide rows (fed to `output_norm` and the output
+  projection when a caller scores a prefix position),
+- per-layer `k[..P]` / `v[..P]` — post q/k-RMSNorm, post-RoPE GQA rows,
+- the identity of the adapter used for those rows.
+
+Because a query `q < block.0` is causal (`key_end = q + 1`), its row never sees
+a block token. Such rows are committed only after a fully successful step; a
+step with `block.0 > P` first computes the causal gap `[P..block.0)` and commits
+it, while a step with `block.0 < P` drops cached rows down to `block.0`.
+
+Invalidation rules:
+
+- if a committed token at index `i < P` changed, the prefix is truncated to `i`;
+- if `block.0 < P`, the prefix is truncated to `block.0`;
+- if `block.0 > P`, rows `[P..block.0)` are computed causally and committed on
+  success;
+- changing the LoRA instance, or switching between `None` and `Some`, clears the
+  entire prefix (identity is compared by pointer address);
+- `positions`, `top_k` and `block.1` changes do not invalidate anything, and
+  tokens at or after `block.1` stay ignored;
+- any `ModelError` leaves the cache exactly as it was — nothing is committed on
+  a failed step.
+
+`denoise_step` / `denoise_step_with_lora` and `denoise_topk` /
+`denoise_topk_with_lora` mirror the free functions. Only fresh rows are
+projected and attended; cached keys/values are read for earlier positions. The
+same `scores` vector, `softmax_in_place`, `crate::simd::dot`, LoRA order and
+residual order are used by both paths, so the synthetic F32 fixtures are
+bit-identical to the uncached oracle (SIMD on and off). When only one fresh row
+remains, the cached projection batch is padded with an unused row so the Q4_0
+`matvec`/`matmul` scalar accumulation orders cannot diverge.
 
 ## Still missing
 
-1. **Block/KV cache.** The step already truncates the backbone at `end` and
-   only scores the requested positions, but the clean prefix is still recomputed
-   every round. A prefix cache and a block cache are the next large performance
-   win.
-2. **A session handle.** Config, tensor lookups and norm tensors are re-read on
-   every call. A `DllmSession` is also the natural home for the KV cache.
-3. **SDAR self-conditioning.** QwenDLM's residual adapter is not implemented;
+1. **SDAR self-conditioning.** QwenDLM's residual adapter is not implemented;
    the base Qwen3 forward is.
-4. **Real-model parity.** The synthetic tiny GGUFs cover the mask and API, and
-   the converted BD3LM validation model now runs end to end. A logit parity
-   check against the PyTorch reference is still required.
-5. **Sampling and ensemble.** The host owns sampling, Self-Repulsion and delta
+2. **Bit-exact BF16 parity.** The synthetic tiny GGUFs cover the mask, API and
+   cache equivalence; the converted BD3LM validation model runs end to end and
+   its top candidates match the PyTorch reference (see below). Q4_0 tail
+   candidates can still swap when logits are near-tied, so bit-exact logit
+   parity with the BF16 checkpoint is not claimed.
+3. **Sampling and ensemble.** The host owns sampling, Self-Repulsion and delta
    merging. Rust only returns scores.
 
 ## Tests
@@ -158,7 +199,11 @@ covers:
 - top-k vs the full distribution and effective `top_k` clamping,
 - a hardened two-layer / 4-query-head / 2-KV-head fixture with non-uniform norms
   and golden logits,
-- invalid token ids, blocks, duplicate positions and an out-of-block tail.
+- invalid token ids, blocks, duplicate positions and an out-of-block tail,
+- `DllmSession` cache equivalence: empty/warm/gap steps, prefix mutation,
+  backwards blocks, prefix scoring, LoRA switches, tail changes, hardened golden
+  logits, error/clear handling, and a randomized multi-step differential with
+  SIMD enabled and disabled.
 
 A real-model smoke test is available behind
 `FRIEDFLAXIA_DLLM_GGUF=/path/to/model.gguf`:
@@ -187,15 +232,61 @@ block. This is an algorithm-validation model, not a production chat model, and
 the converter is a **reference** tool: production artifacts follow the Rust path
 described above, with the Rust GGUF loader as the compatibility authority.
 
+## PyTorch reference parity
+
+`tools/dllm_reference.py` loads the pinned HF checkpoint in BF16 with
+Transformers' stock Qwen3 model and applies the same block mask as the Rust
+kernel. It writes top-k candidates (and optionally raw f32 logits) for a fixed
+token sequence, which the ignored
+`real_dllm_matches_pytorch_reference` test compares against a converted Q8_0
+GGUF:
+
+```sh
+python3 tools/convert_dllm.py <hf-checkpoint-dir> /tmp/dllm-q8.gguf --quant q8_0
+python3 tools/dllm_reference.py --model-dir <hf-checkpoint-dir> \
+  --tokens 151644,872,151645,151669,100,200,300,400 \
+  --block-start 0 --block-end 8 --positions 4,5,6 \
+  --out crates/friedflaxia-core/tests/fixtures/dllm-pytorch-top8.json
+FRIEDFLAXIA_DLLM_Q8_GGUF=/tmp/dllm-q8.gguf \
+  cargo test --release --test dllm -- --ignored --nocapture
+```
+
+On the pinned 0.6B checkpoint, the Q8_0 Rust logits have cosine similarity
+0.9999 with the BF16 reference and agree on top-1 for all three positions and
+on 7 of 8 candidates each. Q4_0 quantization is coarser and swaps near-tied
+tail candidates, which is why the parity fixture uses Q8_0. The CI `dllm-parity`
+job separately verifies the pinned Q4_0 model end to end and the cached-vs-
+uncached equivalence.
+
 ## Performance
 
 A denoise step is a full forward over the active block; a response costs
 `K paths × T steps` of them. Before committing to a 4B model:
 
 1. Measure one step on the target hardware (native first).
-2. Add the block/KV cache so the clean prefix is not recomputed.
+2. Use `DllmSession` so the clean prefix is not recomputed.
 3. Use the existing batched quantized matmul, then wasm SIMD / native threads,
    and finally `wgpu` if the step is still short.
+
+### Native measurement
+
+`crates/friedflaxia-core/examples/dllm_bench.rs` walks an eight-position block
+across a 64-token canvas, runs the free function and `DllmSession` on the same
+inputs, asserts identical top-8 candidates on every step, and prints per-step
+timings:
+
+```sh
+FRIEDFLAXIA_DLLM_GGUF=/path/to/qwen3-bd3lm-q4_0.gguf \
+  cargo run --release --example dllm_bench
+```
+
+On this host (release profile, pinned Q4_0 0.6B model, eight scored positions
+per step) the eight steps took 27.3 s uncached vs 12.6 s cached, **2.17x**,
+with the gap widening from step 2 onward as the committed prefix grows. Both
+paths re-read the GGUF layer tensors on every call, so the remaining floor is
+weight streaming; caching removes the prefix projections/norms/FFN, not the
+attention over cached prefix keys. These are absolute timings for this machine
+only — re-run on the target hardware before sizing a 4B model.
 
 ## Model candidates
 
